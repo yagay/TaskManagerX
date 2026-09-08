@@ -35,6 +35,39 @@ data class SystemSnapshot(
     val timestampMs: Long = 0L,
 )
 
+data class GpuSnapshot(
+    val vendor: String? = null,
+    val renderer: String? = null,
+    val openGlVersion: String? = null,
+    val glslVersion: String? = null,
+    val vulkanSupported: Boolean = false,
+    val vulkanApiVersion: String? = null,
+    val usagePercent: Float? = null,
+    val currentHz: Long? = null,
+    val minHz: Long? = null,
+    val maxHz: Long? = null,
+)
+
+data class NetworkEntry(
+    val uid: Int,
+    val label: String,
+    val packageNames: List<String> = emptyList(),
+    val icon: Drawable? = null,
+    val system: Boolean = false,
+    val rxBytesPerSecond: Long = 0,
+    val txBytesPerSecond: Long = 0,
+) {
+    val totalBytesPerSecond: Long get() = rxBytesPerSecond + txBytesPerSecond
+}
+
+data class NetworkSnapshot(
+    val entries: List<NetworkEntry> = emptyList(),
+    val totalRxBytesPerSecond: Long = 0,
+    val totalTxBytesPerSecond: Long = 0,
+    val backend: String = "Not sampled",
+    val timestampMs: Long = 0L,
+)
+
 enum class ProcessKind {
     USER_APP, SYSTEM_APP, LINUX
 }
@@ -79,6 +112,8 @@ data class TaskManagerUiState(
     val root: RootState = RootState(),
     val framework: FrameworkState = FrameworkState(),
     val system: SystemSnapshot = SystemSnapshot(),
+    val gpu: GpuSnapshot = GpuSnapshot(),
+    val network: NetworkSnapshot = NetworkSnapshot(),
     val processes: List<ProcessEntry> = emptyList(),
     val loading: Boolean = true,
     val query: String = "",
@@ -94,5 +129,6 @@ data class TaskManagerUiState(
     val cpuHistory: List<Float> = emptyList(),
     val ramHistory: List<Float> = emptyList(),
     val swapHistory: List<Float> = emptyList(),
+    val gpuHistory: List<Float> = emptyList(),
     val error: String? = null,
 )
