@@ -44,7 +44,22 @@ fun SystemInfoOverlay(viewModel: MainViewModel) {
         onDismissRequest = { open = false },
         title = { Text("System information") },
         text = {
-            LazyColumn(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                item { Section("CPU usage") }
+                item { HistoryChart(state.cpuHistory) }
+                item { Info("Current", String.format(Locale.US, "%.1f%%", s.cpuPercent)) }
+
+                item { HorizontalDivider(Modifier.padding(vertical = 4.dp)) }
+                item { Section("RAM usage") }
+                item { HistoryChart(state.ramHistory) }
+                item { Info("RAM", "${formatBytes2(s.ramUsedBytes)} / ${formatBytes2(s.ramTotalBytes)} (${percent(s.ramUsedBytes, s.ramTotalBytes)}%)") }
+
+                item { HorizontalDivider(Modifier.padding(vertical = 4.dp)) }
+                item { Section("SWAP usage") }
+                item { HistoryChart(state.swapHistory) }
+                item { Info("SWAP", "${formatBytes2(s.swapUsedBytes)} / ${formatBytes2(s.swapTotalBytes)} (${percent(s.swapUsedBytes, s.swapTotalBytes)}%)") }
+
+                item { HorizontalDivider(Modifier.padding(vertical = 4.dp)) }
                 item { Section("Processor") }
                 item { Info("SoC", s.soc.ifBlank { "Unknown" }) }
                 item { Info("Architecture", s.architecture.ifBlank { "Unknown" }) }
@@ -52,15 +67,15 @@ fun SystemInfoOverlay(viewModel: MainViewModel) {
                 item { Info("CPU cores", s.cpuCoreCount.toString()) }
                 item { Info("Governor", s.governor.ifBlank { "Unknown" }) }
                 item { Info("CPU temperature", s.cpuTemperatureC?.let { String.format(Locale.US, "%.1f °C", it) } ?: "No data") }
-                item { Info("Uptime", formatDuration(s.uptimeMillis)) }
+                item { Info("Uptime", formatDuration2(s.uptimeMillis)) }
                 item { Info("Load average", String.format(Locale.US, "%.2f", s.load1)) }
+
                 item { HorizontalDivider(Modifier.padding(vertical = 4.dp)) }
-                item { Section("Memory") }
-                item { Info("RAM", "${formatBytes2(s.ramUsedBytes)} / ${formatBytes2(s.ramTotalBytes)} (${percent(s.ramUsedBytes, s.ramTotalBytes)}%)") }
+                item { Section("Memory details") }
                 item { Info("Available RAM", formatBytes2(s.ramAvailableBytes)) }
                 item { Info("Cached", formatBytes2(s.cachedBytes)) }
                 item { Info("Buffers", formatBytes2(s.buffersBytes)) }
-                item { Info("SWAP", "${formatBytes2(s.swapUsedBytes)} / ${formatBytes2(s.swapTotalBytes)} (${percent(s.swapUsedBytes, s.swapTotalBytes)}%)") }
+
                 item { HorizontalDivider(Modifier.padding(vertical = 4.dp)) }
                 item { Section("CPU frequencies") }
                 if (s.cpuCores.isEmpty()) {
@@ -68,11 +83,6 @@ fun SystemInfoOverlay(viewModel: MainViewModel) {
                 } else {
                     items(s.cpuCores, key = { it.core }) { core -> CoreRow(core) }
                 }
-                item { HorizontalDivider(Modifier.padding(vertical = 4.dp)) }
-                item { Section("History") }
-                item { Info("CPU samples", "${state.cpuHistory.size} / 60") }
-                item { Info("RAM samples", "${state.ramHistory.size} / 60") }
-                item { Info("SWAP samples", "${state.swapHistory.size} / 60") }
             }
         },
         confirmButton = { TextButton(onClick = { open = false }) { Text("Close") } }
@@ -97,7 +107,7 @@ private fun CoreRow(core: CpuCoreInfo) {
     Column(Modifier.fillMaxWidth()) {
         Text("CPU ${core.core}", style = MaterialTheme.typography.labelMedium)
         Text(
-            "${freq(core.minKHz)}  /  ${freq(core.currentKHz)}  /  ${freq(core.maxKHz)}   min/current/max",
+            "${freq(core.minKHz)} / ${freq(core.currentKHz)} / ${freq(core.maxKHz)}   min/current/max",
             style = MaterialTheme.typography.bodySmall
         )
     }
@@ -113,7 +123,7 @@ private fun formatBytes2(bytes: Long): String {
     while (value >= 1024.0 && index < units.lastIndex) { value /= 1024.0; index++ }
     return String.format(Locale.US, "%.1f %s", value, units[index])
 }
-private fun formatDuration(ms: Long): String {
+private fun formatDuration2(ms: Long): String {
     var seconds = (ms / 1000L).coerceAtLeast(0)
     val days = seconds / 86400; seconds %= 86400
     val hours = seconds / 3600; seconds %= 3600
