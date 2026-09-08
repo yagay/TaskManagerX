@@ -1,66 +1,87 @@
-# TaskManager — Root + LSPosed API 102 refactor
+# TaskManagerX — Root + LSPosed API 102
 
-This is a from-scratch architectural refactor inspired by
-`RohitKushvaha01/TaskManager`.
+A from-scratch Root-first task manager inspired by `RohitKushvaha01/TaskManager`.
+The original Shizuku/native-daemon control path has been replaced with a persistent
+Root shell and a modern libxposed API 102 integration point.
 
-## Phase 1 goals
+## Current features
 
-- Root-only runtime. Shizuku has been removed.
-- Persistent `su` shell rather than starting a new root process for every refresh.
-- Live CPU and RAM overview.
-- Full Linux/Android process list.
-- Search and sort by CPU, memory, name, or PID.
-- PID kill and Android package force-stop.
-- Installed-app label/icon mapping where a numeric UID is available.
-- Modern libxposed API **102.0.0** module entry.
-- Static LSPosed scope is `android` (system framework/system_server).
-- No network-speed UI yet.
-- No floating window yet.
+### Processes
+
+- Full Android/Linux process scan from `/proc`.
+- PID, PPID, UID and Linux user.
+- CPU usage, RSS and virtual memory.
+- Thread count, nice value and process state.
+- Start time and elapsed time.
+- Executable path, cgroup and `oom_score_adj`.
+- Foreground/perceptible low-level approximation.
+- User app, system app and Linux-process filters.
+- Shared UID -> multiple package mapping.
+- App labels and icons.
+- Search and sorting by RAM, CPU, name or PID.
+- Persistent Pin/Unpin.
+- Parent-process navigation.
+- Long-press detail values to copy.
+- Root `kill -9 PID` and Android `am force-stop`.
+- Optional kill confirmation.
+- Configurable automatic refresh (500/800/1000/2000 ms; default 800 ms).
+
+### Resources
+
+- Real-time CPU, RAM, SWAP and GPU history graphs.
+- SoC, architecture, ABI and core count.
+- CPU governor, temperature, uptime and load average.
+- Per-core minimum/current/maximum CPU frequency.
+- RAM available/cached/buffer details.
+- GPU vendor and renderer.
+- OpenGL and GLSL versions.
+- Vulkan support/API version.
+- GPU load and min/current/max frequency when exposed by the device kernel.
+
+### Network
+
+- Real-time per-UID download and upload speed.
+- Shows all active UIDs, including background and system apps.
+- Shared UID package lists are preserved.
+- Active entries are sorted by total throughput.
+- Modern Android backend: Root `dumpsys netd trafficcontroller` -> eBPF `mAppUidStatsMap`.
+- Legacy fallback: `/proc/net/xt_qtaguid/stats`.
+- Public `TrafficStats` is kept only as an own-UID diagnostic fallback because Android N+
+  blocks cross-UID access through that API.
+
+The network page intentionally shows only UIDs that generated traffic during the latest
+sample. No external floating window is implemented.
 
 ## Architecture
 
-```
-UI (Compose)
-  |
+```text
+Compose UI
+   |
 MainViewModel
-  |
-  +-- SystemStatsRepository ----+
-  +-- ProcessRepository --------+--> RootShell --> persistent `su`
-  +-- FrameworkRepository ------+
-  |
-  +-- TaskManagerModule (libxposed API 102, android scope)
+   |
+   +-- ProcessRepository ------ /proc
+   +-- SystemStatsRepository -- /proc + /sys
+   +-- GpuRepository ---------- EGL/GLES + Root sysfs
+   +-- NetworkRepository ------ Root netd eBPF / qtaguid
+   +-- SettingsRepository
+   +-- FrameworkRepository
+   |
+Persistent RootShell ---------- su
+
+TaskManagerModule ------------- libxposed API 102, android scope
 ```
 
-Root is the primary data/control plane. LSPosed is an enhancement plane.
-This separation is intentional: a bad framework hook must never be required
-for the task manager itself to function.
+Root is the primary data/control plane. LSPosed is an optional enhancement layer and is
+not required for the core task manager to remain usable. Keeping the two planes separate
+reduces `system_server` hook risk and makes Android/OEM updates easier to support.
 
-## Why the original daemon/Shizuku path was replaced
+## Why Shizuku / the upstream daemon are not used
 
-The upstream project starts a native daemon through Shizuku or root and then
-talks to it through process stdin/stdout. This refactor removes the Shizuku
-state machine and makes privilege ownership explicit: all phase-1 privileged
-operations go through one root shell. The API 102 module is kept deliberately
-minimal until a system hook is actually needed.
-
-## Planned phase 2: per-app real-time network speed
-
-The next layer should be **UID based**, not foreground-app based:
-
-1. Obtain system-wide UID RX/TX counters.
-2. Snapshot at a configurable interval (500–1000 ms).
-3. Compute deltas per UID.
-4. Map UID -> one or more packages.
-5. Keep background and system UIDs.
-6. Sort active UIDs by live throughput.
-7. Add interface filters (Wi-Fi/mobile/VPN) after correctness is established.
-
-A backend abstraction should allow:
-- eBPF/netd/NetworkStats based root backend
-- LSPosed system_server compatibility backend
-- public Android API fallback where useful
-
-No overlay/floating UI is part of phase 1.
+The upstream application can start a native task-manager daemon through Shizuku or Root
+and communicate with it through stdin/stdout. TaskManagerX deliberately replaces that
+state machine with one persistent Root shell and direct `/proc`, `/sys`, EGL and netd
+collection. This keeps privilege ownership explicit and avoids making UI functionality
+dependent on a second daemon process.
 
 ## Build
 
@@ -72,9 +93,7 @@ Expected environment:
 - Android Gradle Plugin 9.2.0
 - libxposed API 102.0.0
 
-The Gradle wrapper properties are included. A wrapper JAR is intentionally not
-vendored in this generated source archive. If your checkout does not already have
-one, run `gradle wrapper --gradle-version 9.4.1` once or let Android Studio recreate it.
+GitHub Actions builds `:app:assembleDebug` and uploads `TaskManagerX-debug` as an artifact.
 
 ## LSPosed
 
@@ -84,19 +103,21 @@ Modern API metadata:
 - `META-INF/xposed/module.prop`
 - `META-INF/xposed/scope.list`
 
-Scope:
+Static scope:
 
-```
+```text
 android
 ```
 
-Enable the module in LSPosed and enable the Android/System Framework scope.
+The API-102 module entry is intentionally conservative. Root provides the current feature
+set; framework hooks can be added later only where they materially improve accuracy or
+compatibility.
 
 ## Attribution
 
-The product concept and feature baseline were studied from:
+Feature behaviour and product ideas were studied from:
 
 - RohitKushvaha01/TaskManager — Apache License 2.0
 
-This refactor was written from scratch rather than copying the upstream
-application source files. See `UPSTREAM.md`.
+TaskManagerX is a from-scratch implementation rather than a copy of the upstream source.
+See `UPSTREAM.md`.
