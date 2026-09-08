@@ -7,6 +7,7 @@ import com.rk.taskmanager.data.FrameworkRepository
 import com.rk.taskmanager.data.ProcessRepository
 import com.rk.taskmanager.data.SystemStatsRepository
 import com.rk.taskmanager.model.ProcessEntry
+import com.rk.taskmanager.model.ProcessFilter
 import com.rk.taskmanager.model.ProcessSort
 import com.rk.taskmanager.model.RootState
 import com.rk.taskmanager.model.TaskManagerUiState
@@ -74,6 +75,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun setSort(sort: ProcessSort) {
         _state.value = _state.value.copy(sort = sort)
+    }
+
+    fun setFilter(filter: ProcessFilter) {
+        _state.value = _state.value.copy(filter = filter)
     }
 
     fun killProcess(process: ProcessEntry) {

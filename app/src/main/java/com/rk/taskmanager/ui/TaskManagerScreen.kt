@@ -58,8 +58,12 @@ import androidx.compose.ui.unit.dp
 import androidx.core.graphics.drawable.toBitmap
 import com.rk.taskmanager.MainViewModel
 import com.rk.taskmanager.model.ProcessEntry
+import com.rk.taskmanager.model.ProcessFilter
+import com.rk.taskmanager.model.ProcessKind
 import com.rk.taskmanager.model.ProcessSort
 import com.rk.taskmanager.model.TaskManagerUiState
+import java.text.DateFormat
+import java.util.Date
 import java.util.Locale
 import kotlin.math.max
 
@@ -80,7 +84,7 @@ fun TaskManagerApp(viewModel: MainViewModel) {
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("TaskManager") },
+                title = { Text("TaskManagerX") },
                 actions = {
                     IconButton(onClick = viewModel::refresh) {
                         Icon(Icons.Default.Refresh, contentDescription = "Refresh")
@@ -100,8 +104,10 @@ fun TaskManagerApp(viewModel: MainViewModel) {
             FilterSection(
                 query = state.query,
                 sort = state.sort,
+                filter = state.filter,
                 onQuery = viewModel::setQuery,
                 onSort = viewModel::setSort,
+                onFilter = viewModel::setFilter,
             )
 
             if (state.loading) {
@@ -109,10 +115,7 @@ fun TaskManagerApp(viewModel: MainViewModel) {
                     CircularProgressIndicator()
                 }
             } else {
-                ProcessList(
-                    state = state,
-                    onClick = { selected = it }
-                )
+                ProcessList(state = state, onClick = { selected = it })
             }
         }
     }
@@ -141,18 +144,12 @@ private fun StatusSection(state: TaskManagerUiState) {
             .padding(horizontal = 12.dp, vertical = 4.dp),
         horizontalArrangement = Arrangement.spacedBy(8.dp)
     ) {
-        AssistChip(
-            onClick = {},
-            label = {
-                Text(if (state.root.granted) "Root: OK" else "Root: unavailable")
-            }
-        )
-        AssistChip(
-            onClick = {},
-            label = {
-                Text(if (state.framework.detected) "LSPosed: detected" else "LSPosed: not detected")
-            }
-        )
+        AssistChip(onClick = {}, label = {
+            Text(if (state.root.granted) "Root: OK" else "Root: unavailable")
+        })
+        AssistChip(onClick = {}, label = {
+            Text(if (state.framework.detected) "LSPosed: detected" else "LSPosed: not detected")
+        })
     }
 }
 
@@ -180,15 +177,17 @@ private fun SystemSection(state: TaskManagerUiState) {
             } else 0f
         )
     }
+    if (s.swapTotalBytes > 0L) {
+        Text(
+            "SWAP ${formatBytes(s.swapUsedBytes)} / ${formatBytes(s.swapTotalBytes)}  •  Load ${String.format(Locale.getDefault(), "%.2f", s.load1)}",
+            modifier = Modifier.padding(horizontal = 14.dp, vertical = 4.dp),
+            style = MaterialTheme.typography.bodySmall
+        )
+    }
 }
 
 @Composable
-private fun MetricCard(
-    modifier: Modifier,
-    title: String,
-    value: String,
-    progress: Float,
-) {
+private fun MetricCard(modifier: Modifier, title: String, value: String, progress: Float) {
     Card(modifier) {
         Column(Modifier.padding(12.dp)) {
             Text(title, style = MaterialTheme.typography.labelMedium)
@@ -207,8 +206,10 @@ private fun MetricCard(
 private fun FilterSection(
     query: String,
     sort: ProcessSort,
+    filter: ProcessFilter,
     onQuery: (String) -> Unit,
     onSort: (ProcessSort) -> Unit,
+    onFilter: (ProcessFilter) -> Unit,
 ) {
     Column(Modifier.padding(horizontal = 12.dp, vertical = 8.dp)) {
         OutlinedTextField(
@@ -224,9 +225,18 @@ private fun FilterSection(
                     }
                 }
             },
-            placeholder = { Text("Process, app, package, PID") }
+            placeholder = { Text("Process, app, package, PID, UID") }
         )
         Spacer(Modifier.height(6.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            ProcessFilter.entries.forEach { item ->
+                FilterChip(
+                    selected = filter == item,
+                    onClick = { onFilter(item) },
+                    label = { Text(filterLabel(item)) }
+                )
+            }
+        }
         Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
             ProcessSort.entries.forEach { item ->
                 FilterChip(
@@ -240,19 +250,25 @@ private fun FilterSection(
 }
 
 @Composable
-private fun ProcessList(
-    state: TaskManagerUiState,
-    onClick: (ProcessEntry) -> Unit,
-) {
-    val filtered = remember(state.processes, state.query, state.sort) {
+private fun ProcessList(state: TaskManagerUiState, onClick: (ProcessEntry) -> Unit) {
+    val filtered = remember(state.processes, state.query, state.sort, state.filter) {
         state.processes
             .asSequence()
+            .filter {
+                when (state.filter) {
+                    ProcessFilter.ALL -> true
+                    ProcessFilter.USER_APPS -> it.kind == ProcessKind.USER_APP
+                    ProcessFilter.SYSTEM_APPS -> it.kind == ProcessKind.SYSTEM_APP
+                    ProcessFilter.LINUX -> it.kind == ProcessKind.LINUX
+                }
+            }
             .filter {
                 val q = state.query.trim()
                 q.isEmpty() ||
                     it.displayName.contains(q, true) ||
-                    it.packageName?.contains(q, true) == true ||
+                    it.packageNames.any { pkg -> pkg.contains(q, true) } ||
                     it.command.contains(q, true) ||
+                    it.userName.contains(q, true) ||
                     it.pid.toString() == q ||
                     it.uid.toString() == q
             }
@@ -276,10 +292,7 @@ private fun ProcessList(
 }
 
 @Composable
-private fun ProcessRow(
-    process: ProcessEntry,
-    onClick: (ProcessEntry) -> Unit,
-) {
+private fun ProcessRow(process: ProcessEntry, onClick: (ProcessEntry) -> Unit) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
@@ -290,14 +303,20 @@ private fun ProcessRow(
         AppIcon(process.icon)
         Spacer(Modifier.size(10.dp))
         Column(Modifier.weight(1f)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    process.displayName,
+                    fontWeight = FontWeight.Medium,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f)
+                )
+                if (process.isForeground) {
+                    Text("FG", style = MaterialTheme.typography.labelSmall)
+                }
+            }
             Text(
-                process.displayName,
-                fontWeight = FontWeight.Medium,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis
-            )
-            Text(
-                "PID ${process.pid}  UID ${process.uid}  ${process.state}",
+                "PID ${process.pid}  ${process.userName}  ${kindLabel(process.kind)}  ${process.threads}T",
                 style = MaterialTheme.typography.bodySmall,
                 maxLines = 1
             )
@@ -307,10 +326,7 @@ private fun ProcessRow(
                 String.format(Locale.getDefault(), "%.1f%%", process.cpuPercent),
                 style = MaterialTheme.typography.bodyMedium
             )
-            Text(
-                formatBytes(process.rssKb * 1024L),
-                style = MaterialTheme.typography.bodySmall
-            )
+            Text(formatBytes(process.rssKb * 1024L), style = MaterialTheme.typography.bodySmall)
         }
     }
 }
@@ -319,9 +335,7 @@ private fun ProcessRow(
 private fun AppIcon(drawable: Drawable?) {
     if (drawable == null) {
         Box(
-            modifier = Modifier
-                .size(40.dp)
-                .clip(RoundedCornerShape(10.dp)),
+            modifier = Modifier.size(40.dp).clip(RoundedCornerShape(10.dp)),
             contentAlignment = Alignment.Center
         ) {
             Icon(Icons.Default.Memory, contentDescription = null)
@@ -337,9 +351,7 @@ private fun AppIcon(drawable: Drawable?) {
     Image(
         bitmap = bitmap,
         contentDescription = null,
-        modifier = Modifier
-            .size(40.dp)
-            .clip(RoundedCornerShape(10.dp))
+        modifier = Modifier.size(40.dp).clip(RoundedCornerShape(10.dp))
     )
 }
 
@@ -354,34 +366,37 @@ private fun ProcessDialog(
         onDismissRequest = onDismiss,
         title = { Text(process.displayName) },
         text = {
-            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                Detail("PID", process.pid.toString())
-                Detail("PPID", process.ppid.toString())
-                Detail("UID", process.uid.toString())
-                Detail("CPU", String.format(Locale.getDefault(), "%.1f%%", process.cpuPercent))
-                Detail("RAM", formatBytes(process.rssKb * 1024L))
-                Detail("Nice", process.nice.toString())
-                Detail("State", process.state)
-                process.packageName?.let { Detail("Package", it) }
-                Detail("Command", process.command)
+            LazyColumn(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                item { Detail("PID", process.pid.toString()) }
+                item { Detail("Parent PID", process.ppid.toString()) }
+                item { Detail("UID", process.uid.toString()) }
+                item { Detail("User", process.userName) }
+                item { Detail("CPU Usage", String.format(Locale.getDefault(), "%.1f%%", process.cpuPercent)) }
+                item { Detail("Actual RAM (RSS)", formatBytes(process.rssKb * 1024L)) }
+                item { Detail("Foreground", if (process.isForeground) "Yes" else "No") }
+                item { Detail("Threads", process.threads.toString()) }
+                item { Detail("Nice Value", process.nice.toString()) }
+                item { Detail("Status", process.state) }
+                item { Detail("Start Time", formatStartTime(process.startTimeMillis)) }
+                item { Detail("Elapsed Time", formatDuration(process.elapsedTimeMillis)) }
+                process.executablePath?.let { path -> item { Detail("Executable Path", path) } }
+                if (process.packageNames.isNotEmpty()) {
+                    item { Detail("Package", process.packageNames.joinToString("\n")) }
+                }
+                item { Detail("Command", process.command) }
+                process.oomScoreAdj?.let { value -> item { Detail("OOM score adj", value.toString()) } }
             }
         },
         confirmButton = {
             Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                 if (process.packageName != null) {
-                    Button(onClick = onForceStop) {
-                        Text("Force stop")
-                    }
+                    Button(onClick = onForceStop) { Text("Force stop") }
                 }
-                Button(onClick = onKill) {
-                    Text("Kill PID")
-                }
+                Button(onClick = onKill) { Text("Kill PID") }
             }
         },
         dismissButton = {
-            TextButton(onClick = onDismiss) {
-                Text("Close")
-            }
+            TextButton(onClick = onDismiss) { Text("Close") }
         }
     )
 }
@@ -389,6 +404,40 @@ private fun ProcessDialog(
 @Composable
 private fun Detail(label: String, value: String) {
     Text("$label: $value", style = MaterialTheme.typography.bodyMedium)
+}
+
+private fun filterLabel(filter: ProcessFilter): String = when (filter) {
+    ProcessFilter.ALL -> "All"
+    ProcessFilter.USER_APPS -> "User"
+    ProcessFilter.SYSTEM_APPS -> "System"
+    ProcessFilter.LINUX -> "Linux"
+}
+
+private fun kindLabel(kind: ProcessKind): String = when (kind) {
+    ProcessKind.USER_APP -> "User"
+    ProcessKind.SYSTEM_APP -> "System"
+    ProcessKind.LINUX -> "Linux"
+}
+
+private fun formatStartTime(timeMs: Long): String {
+    if (timeMs <= 0L) return "Unknown"
+    return DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.MEDIUM).format(Date(timeMs))
+}
+
+private fun formatDuration(ms: Long): String {
+    var seconds = (ms / 1000L).coerceAtLeast(0L)
+    val days = seconds / 86400L
+    seconds %= 86400L
+    val hours = seconds / 3600L
+    seconds %= 3600L
+    val minutes = seconds / 60L
+    val secs = seconds % 60L
+    return buildString {
+        if (days > 0) append("${days}d ")
+        if (hours > 0 || days > 0) append("${hours}h ")
+        if (minutes > 0 || hours > 0 || days > 0) append("${minutes}m ")
+        append("${secs}s")
+    }
 }
 
 private fun formatBytes(bytes: Long): String {
