@@ -110,7 +110,7 @@ data class ProcessEntry(
 }
 
 enum class ProcessSort {
-    MEMORY, CPU, NETWORK, NAME, PID
+    MEMORY, CPU, DOWNLOAD, UPLOAD, NAME, PID
 }
 
 data class TaskManagerUiState(
