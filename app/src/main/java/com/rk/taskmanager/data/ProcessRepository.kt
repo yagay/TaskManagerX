@@ -16,7 +16,7 @@ class ProcessRepository(
 ) {
     private val packageManager = context.packageManager
     private var packageCache: Map<Int, List<PackageIdentity>> = emptyMap()
-    private var cacheTime = 0L
+    private var packageCacheInitialized = false
     private var previousTicks: Map<Int, Long> = emptyMap()
     private var previousSampleMs: Long = 0L
     private var clockTicksPerSecond: Long = 100L
@@ -24,29 +24,70 @@ class ProcessRepository(
     suspend fun listProcesses(): List<ProcessEntry> = withContext(Dispatchers.IO) {
         refreshPackageCacheIfNeeded()
 
+        // Hot-path rule: avoid spawning cat/awk/stat/sed/readlink once per PID.
+        // Android's /system/bin/sh supports the read/case builtins used here, so each
+        // process normally costs only direct procfs reads inside one persistent root shell.
         val script = """
             HZ=$(getconf CLK_TCK 2>/dev/null || echo 100)
-            UP=$(cut -d' ' -f1 /proc/uptime 2>/dev/null)
+            IFS=' ' read -r UP _ < /proc/uptime 2>/dev/null || UP=0
             echo "__META__|${'$'}HZ|${'$'}UP"
             for p in /proc/[0-9]*; do
               pid=${'$'}{p##*/}
-              statline=$(cat "${'$'}p/stat" 2>/dev/null) || continue
-              uid=$(awk '/^Uid:/{print ${'$'}2; exit}' "${'$'}p/status" 2>/dev/null)
-              rss=$(awk '/^VmRSS:/{print ${'$'}2; exit}' "${'$'}p/status" 2>/dev/null)
-              vmsize=$(awk '/^VmSize:/{print ${'$'}2; exit}' "${'$'}p/status" 2>/dev/null)
-              threads=$(awk '/^Threads:/{print ${'$'}2; exit}' "${'$'}p/status" 2>/dev/null)
-              user=$(stat -c %U "${'$'}p" 2>/dev/null)
-              oom=$(cat "${'$'}p/oom_score_adj" 2>/dev/null)
-              cmd=$(tr '\000\t\r\n' '    ' < "${'$'}p/cmdline" 2>/dev/null | sed 's/[[:space:]]\+/ /g; s/^ //; s/ ${'$'}//')
-              exe=$(readlink "${'$'}p/exe" 2>/dev/null | tr '\t\r\n|' '    ')
-              cgroup=$(tr '\n\t\r|' '    ' < "${'$'}p/cgroup" 2>/dev/null | sed 's/[[:space:]]\+/ /g; s/^ //; s/ ${'$'}//')
-              printf '__PROC__|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' "${'$'}pid" "${'$'}uid" "${'$'}rss" "${'$'}vmsize" "${'$'}threads" "${'$'}user" "${'$'}oom" "${'$'}cmd" "${'$'}exe" "${'$'}cgroup"
+              IFS= read -r statline < "${'$'}p/stat" 2>/dev/null || continue
+
+              uid=-1
+              rss=0
+              vmsize=0
+              threads=0
+              while IFS= read -r line; do
+                case "${'$'}line" in
+                  Uid:*) set -- ${'$'}line; uid=${'$'}2 ;;
+                  VmRSS:*) set -- ${'$'}line; rss=${'$'}2 ;;
+                  VmSize:*) set -- ${'$'}line; vmsize=${'$'}2 ;;
+                  Threads:*) set -- ${'$'}line; threads=${'$'}2 ;;
+                esac
+              done < "${'$'}p/status" 2>/dev/null
+
+              oom=0
+              IFS= read -r oom < "${'$'}p/oom_score_adj" 2>/dev/null || oom=0
+
+              cmd=''
+              IFS= read -r -d '' cmd < "${'$'}p/cmdline" 2>/dev/null || true
+              [ -n "${'$'}cmd" ] || cmd='-'
+
+              printf '__PROC__|%s|%s|%s|%s|%s|%s|%s\n' \
+                "${'$'}pid" "${'$'}uid" "${'$'}rss" "${'$'}vmsize" "${'$'}threads" "${'$'}oom" "${'$'}cmd"
               printf '__STAT__|%s\n' "${'$'}statline"
             done
         """.trimIndent()
 
-        val raw = shell.execute(script, 15_000).stdout
+        val raw = shell.execute(script, 8_000).stdout
         parseProcDump(raw)
+    }
+
+    suspend fun loadDetails(process: ProcessEntry): ProcessEntry = withContext(Dispatchers.IO) {
+        val pid = process.pid
+        if (pid <= 0) return@withContext process
+        val raw = runCatching {
+            shell.execute(
+                """
+                    p=/proc/$pid
+                    [ -d "${'$'}p" ] || exit 1
+                    exe=$(readlink "${'$'}p/exe" 2>/dev/null | tr '\t\r\n|' '    ')
+                    cgroup=$(tr '\n\t\r|' '    ' < "${'$'}p/cgroup" 2>/dev/null)
+                    user=$(stat -c %U "${'$'}p" 2>/dev/null)
+                    printf '%s|%s|%s\n' "${'$'}user" "${'$'}exe" "${'$'}cgroup"
+                """.trimIndent(),
+                3_000,
+            ).stdout
+        }.getOrDefault("")
+        if (raw.isBlank()) return@withContext process
+        val parts = raw.lineSequence().last().split('|', limit = 3)
+        process.copy(
+            userName = parts.getOrNull(0)?.takeIf { it.isNotBlank() } ?: process.userName,
+            executablePath = parts.getOrNull(1)?.takeIf { it.isNotBlank() },
+            cgroup = parts.getOrNull(2)?.takeIf { it.isNotBlank() },
+        )
     }
 
     suspend fun killProcess(pid: Int): Boolean {
@@ -85,7 +126,7 @@ class ProcessRepository(
                 continue
             }
 
-            val proc = procLine.split('|', limit = 11)
+            val proc = procLine.split('|', limit = 8)
             val pid = proc.getOrNull(1)?.toIntOrNull()
             val stat = parseStat(statLine.removePrefix("__STAT__|"))
             if (pid == null || stat == null || stat.pid != pid) {
@@ -97,11 +138,8 @@ class ProcessRepository(
             val rssKb = proc.getOrNull(3)?.toLongOrNull() ?: 0L
             val virtualMemoryKb = proc.getOrNull(4)?.toLongOrNull() ?: 0L
             val threads = proc.getOrNull(5)?.toIntOrNull() ?: stat.threads
-            val userName = proc.getOrNull(6).orEmpty().ifBlank { uid.toString() }
-            val oom = proc.getOrNull(7)?.toIntOrNull()
-            val command = proc.getOrNull(8).orEmpty().ifBlank { stat.name }
-            val exe = proc.getOrNull(9)?.takeIf { it.isNotBlank() }
-            val cgroup = proc.getOrNull(10)?.takeIf { it.isNotBlank() }
+            val oom = proc.getOrNull(6)?.toIntOrNull()
+            val command = proc.getOrNull(7).orEmpty().takeUnless { it == "-" }.orEmpty().ifBlank { stat.name }
 
             val totalTicks = stat.userTicks + stat.systemTicks
             newTicks[pid] = totalTicks
@@ -132,7 +170,7 @@ class ProcessRepository(
                 pid = pid,
                 ppid = stat.ppid,
                 uid = uid,
-                userName = userName,
+                userName = uid.toString(),
                 nice = stat.nice,
                 state = stat.state,
                 rssKb = rssKb,
@@ -140,8 +178,8 @@ class ProcessRepository(
                 cpuPercent = cpuPercent,
                 name = stat.name,
                 command = command,
-                executablePath = exe,
-                cgroup = cgroup,
+                executablePath = null,
+                cgroup = null,
                 threads = threads,
                 startTimeMillis = startTimeMillis,
                 elapsedTimeMillis = elapsedMs,
@@ -185,8 +223,7 @@ class ProcessRepository(
     }
 
     private fun refreshPackageCacheIfNeeded() {
-        val now = System.currentTimeMillis()
-        if (packageCache.isNotEmpty() && now - cacheTime < 60_000) return
+        if (packageCacheInitialized) return
 
         @Suppress("DEPRECATION")
         val apps = packageManager.getInstalledApplications(PackageManager.GET_META_DATA)
@@ -204,7 +241,7 @@ class ProcessRepository(
         }
 
         packageCache = map
-        cacheTime = now
+        packageCacheInitialized = true
     }
 
     private data class ProcStat(
