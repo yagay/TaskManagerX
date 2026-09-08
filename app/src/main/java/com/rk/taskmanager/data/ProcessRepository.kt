@@ -27,7 +27,7 @@ class ProcessRepository(
         val script = """
             HZ=$(getconf CLK_TCK 2>/dev/null || echo 100)
             UP=$(cut -d' ' -f1 /proc/uptime 2>/dev/null)
-            echo "__META__|$HZ|$UP"
+            echo "__META__|${'$'}HZ|${'$'}UP"
             for p in /proc/[0-9]*; do
               pid=${'$'}{p##*/}
               statline=$(cat "${'$'}p/stat" 2>/dev/null) || continue
