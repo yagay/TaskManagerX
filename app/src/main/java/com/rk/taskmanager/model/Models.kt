@@ -97,15 +97,20 @@ data class ProcessEntry(
     val icon: Drawable? = null,
     val kind: ProcessKind = ProcessKind.LINUX,
     val isPinned: Boolean = false,
+    val rxBytesPerSecond: Long = 0L,
+    val txBytesPerSecond: Long = 0L,
 ) {
     val displayName: String
         get() = appLabel?.takeIf { it.isNotBlank() }
             ?: packageName?.takeIf { it.isNotBlank() }
             ?: name
+
+    val totalNetworkBytesPerSecond: Long
+        get() = rxBytesPerSecond + txBytesPerSecond
 }
 
 enum class ProcessSort {
-    MEMORY, CPU, NAME, PID
+    MEMORY, CPU, NETWORK, NAME, PID
 }
 
 data class TaskManagerUiState(
