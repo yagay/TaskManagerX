@@ -4,6 +4,7 @@ import android.app.Application
 import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
 import android.net.TrafficStats
+import android.os.Process
 import android.os.SystemClock
 import com.rk.taskmanager.model.NetworkEntry
 import com.rk.taskmanager.model.NetworkSnapshot
@@ -25,25 +26,31 @@ class NetworkRepository(
     suspend fun read(knownUids: Set<Int>): NetworkSnapshot = withContext(Dispatchers.IO) {
         refreshPackageCacheIfNeeded()
         val nowNanos = SystemClock.elapsedRealtimeNanos()
-        val rootCounters = readRootQtaguid()
-        val allUids = buildSet {
-            addAll(packageCache.keys)
-            addAll(knownUids.filter { it >= 0 })
-            addAll(rootCounters.keys)
-        }
+
+        val netdCounters = readRootNetdEbpf()
+        val qtaguidCounters = if (netdCounters.isEmpty()) readRootQtaguid() else emptyMap()
 
         val backend: String
         val current: Map<Int, Counter>
-        if (rootCounters.isNotEmpty()) {
-            backend = "Root qtaguid"
-            current = rootCounters
-        } else {
-            backend = "TrafficStats"
-            current = allUids.mapNotNull { uid ->
+        when {
+            netdCounters.isNotEmpty() -> {
+                backend = "Root netd eBPF"
+                current = netdCounters
+            }
+            qtaguidCounters.isNotEmpty() -> {
+                backend = "Root qtaguid"
+                current = qtaguidCounters
+            }
+            else -> {
+                // Android N+ public TrafficStats can only read the calling UID.
+                // Keep this last-resort path for diagnostics rather than pretending
+                // it represents all applications.
+                backend = "TrafficStats (own UID only)"
+                val uid = Process.myUid()
                 val rx = TrafficStats.getUidRxBytes(uid)
                 val tx = TrafficStats.getUidTxBytes(uid)
-                if (rx < 0L || tx < 0L) null else uid to Counter(rx, tx)
-            }.toMap()
+                current = if (rx >= 0L && tx >= 0L) mapOf(uid to Counter(rx, tx)) else emptyMap()
+            }
         }
 
         val elapsedSeconds = if (previousNanos > 0L) {
@@ -84,6 +91,50 @@ class NetworkRepository(
         )
     }
 
+    /**
+     * Modern Android (9+) accounts traffic in netd eBPF maps. AOSP exposes the
+     * aggregate per-UID map through `dumpsys netd trafficcontroller` as:
+     *
+     *   mAppUidStatsMap:
+     *   uid rxBytes rxPackets txBytes txPackets
+     *   10234 12345 100 67890 120
+     *
+     * Root lets us read this without the public API's cross-UID privacy limit.
+     */
+    private suspend fun readRootNetdEbpf(): Map<Int, Counter> {
+        val raw = runCatching {
+            shell.execute("dumpsys netd trafficcontroller 2>/dev/null", 6_000).stdout
+        }.getOrDefault("")
+        if (!raw.contains("mAppUidStatsMap")) return emptyMap()
+
+        val result = HashMap<Int, Counter>()
+        var inAppUidStats = false
+        raw.lineSequence().forEach { original ->
+            val line = original.trim()
+            if (line.contains("mAppUidStatsMap")) {
+                inAppUidStats = true
+                return@forEach
+            }
+            if (!inAppUidStats) return@forEach
+
+            // The following map starts after AppUidStatsMap. Stop before parsing it.
+            if (line.contains("mStatsMap") || line.contains("mUidStatsMap") || line.contains("mTagStatsMap")) {
+                inAppUidStats = false
+                return@forEach
+            }
+            if (line.isBlank() || line.startsWith("uid ") || line.startsWith("BPF map")) return@forEach
+
+            val parts = line.split(Regex("\\s+"))
+            if (parts.size != 5) return@forEach
+            val uid = parts[0].toIntOrNull() ?: return@forEach
+            val rx = parts[1].toLongOrNull() ?: return@forEach
+            val tx = parts[3].toLongOrNull() ?: return@forEach
+            result[uid] = Counter(rx, tx)
+        }
+        return result
+    }
+
+    /** Legacy fallback for older/vendor kernels that still expose xt_qtaguid. */
     private suspend fun readRootQtaguid(): Map<Int, Counter> {
         val raw = runCatching {
             shell.execute(
