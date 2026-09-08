@@ -15,6 +15,8 @@ import com.rk.taskmanager.model.RootState
 import com.rk.taskmanager.model.TaskManagerUiState
 import com.rk.taskmanager.root.RootShell
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -23,12 +25,19 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
 class MainViewModel(application: Application) : AndroidViewModel(application) {
-    private val shell = RootShell()
-    private val processRepository = ProcessRepository(application, shell)
-    private val statsRepository = SystemStatsRepository(shell)
-    private val gpuRepository = GpuRepository(application, shell)
-    private val networkRepository = NetworkRepository(application, shell)
-    private val frameworkRepository = FrameworkRepository(shell)
+    // Each collector owns a persistent root shell. RootShell serializes commands internally,
+    // so sharing one shell made process/GPU/network/system collection block each other.
+    private val processShell = RootShell()
+    private val statsShell = RootShell()
+    private val gpuShell = RootShell()
+    private val networkShell = RootShell()
+    private val frameworkShell = RootShell()
+
+    private val processRepository = ProcessRepository(application, processShell)
+    private val statsRepository = SystemStatsRepository(statsShell)
+    private val gpuRepository = GpuRepository(application, gpuShell)
+    private val networkRepository = NetworkRepository(application, networkShell)
+    private val frameworkRepository = FrameworkRepository(frameworkShell)
     private val settings = SettingsRepository(application)
 
     private val _state = MutableStateFlow(
@@ -51,7 +60,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun start() {
         if (monitorJob?.isActive == true) return
         monitorJob = viewModelScope.launch {
-            val rootGranted = shell.isRootAvailable()
+            val rootGranted = processShell.isRootAvailable()
             _state.value = _state.value.copy(
                 root = RootState(
                     checked = true,
@@ -82,6 +91,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun refresh() {
         viewModelScope.launch {
             if (_state.value.root.granted) refreshInternal() else start()
+        }
+    }
+
+    fun loadProcessDetails(process: ProcessEntry, onLoaded: (ProcessEntry) -> Unit) {
+        viewModelScope.launch {
+            onLoaded(processRepository.loadDetails(process))
         }
     }
 
@@ -159,14 +174,24 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         _state.value = _state.value.copy(error = null)
     }
 
-    private suspend fun refreshInternal() {
+    private suspend fun refreshInternal() = coroutineScope {
         runCatching {
-            val system = statsRepository.read()
-            val pinned = settings.pinnedProcesses
-            val processes = processRepository.listProcesses().map { process ->
-                process.copy(isPinned = pinKey(process) in pinned)
+            // System, process and GPU collection are independent and can run concurrently.
+            val systemDeferred = async { statsRepository.read() }
+            val processDeferred = async {
+                val pinned = settings.pinnedProcesses
+                processRepository.listProcesses().map { process ->
+                    process.copy(isPinned = pinKey(process) in pinned)
+                }
             }
-            val gpu = gpuRepository.read()
+            val gpuDeferred = async { gpuRepository.read() }
+
+            val system = systemDeferred.await()
+            val processes = processDeferred.await()
+            val gpu = gpuDeferred.await()
+
+            // Network needs the current UID set, but it owns a separate root shell so it
+            // no longer blocks the process scanner itself.
             val network = networkRepository.read(processes.map { it.uid }.filter { it >= 0 }.toSet())
 
             val old = _state.value
@@ -203,7 +228,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     override fun onCleared() {
         monitorJob?.cancel()
-        shell.close()
+        processShell.close()
+        statsShell.close()
+        gpuShell.close()
+        networkShell.close()
+        frameworkShell.close()
         super.onCleared()
     }
 }
