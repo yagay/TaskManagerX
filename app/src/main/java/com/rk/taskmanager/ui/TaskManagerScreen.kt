@@ -9,6 +9,7 @@ import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -106,7 +107,7 @@ fun TaskManagerApp(viewModel: MainViewModel) {
                             when (page) {
                                 HomePage.PROCESSES -> "${state.processCount} processes • ${state.threadCount} threads"
                                 HomePage.RESOURCES -> "CPU • RAM • GPU"
-                                HomePage.NETWORK -> "↓ ${formatSpeed(state.network.totalRxBytesPerSecond)}  ↑ ${formatSpeed(state.network.totalTxBytesPerSecond)}"
+                                HomePage.NETWORK -> "Per-app realtime download / upload"
                             },
                             style = MaterialTheme.typography.labelSmall,
                         )
@@ -261,9 +262,6 @@ private fun StatusSection(state: TaskManagerUiState) {
     ) {
         AssistChip(onClick = {}, label = { Text(if (state.root.granted) "Root: OK" else "Root: unavailable") })
         AssistChip(onClick = {}, label = { Text(if (state.framework.detected) "LSPosed: detected" else "LSPosed: not detected") })
-        if (state.network.backend != "Not sampled") {
-            AssistChip(onClick = {}, label = { Text(state.network.backend) })
-        }
     }
 }
 
@@ -294,9 +292,9 @@ private fun FilterSection(
         )
         Spacer(Modifier.height(6.dp))
         Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-            FilterChip(state.showUserApps, { onUser(!state.showUserApps) }, label = { Text("User") })
-            FilterChip(state.showSystemApps, { onSystem(!state.showSystemApps) }, label = { Text("System") })
-            FilterChip(state.showLinuxProcesses, { onLinux(!state.showLinuxProcesses) }, label = { Text("Linux") })
+            FilterChip(selected = state.showUserApps, onClick = { onUser(!state.showUserApps) }, label = { Text("User") })
+            FilterChip(selected = state.showSystemApps, onClick = { onSystem(!state.showSystemApps) }, label = { Text("System") })
+            FilterChip(selected = state.showLinuxProcesses, onClick = { onLinux(!state.showLinuxProcesses) }, label = { Text("Linux") })
         }
         Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
             ProcessSort.entries.forEach { item ->
@@ -343,7 +341,8 @@ private fun ProcessList(state: TaskManagerUiState, onClick: (ProcessEntry) -> Un
                 when (state.sort) {
                     ProcessSort.CPU -> seq.sortedByDescending { it.cpuPercent }
                     ProcessSort.MEMORY -> seq.sortedByDescending { it.rssKb }
-                    ProcessSort.NETWORK -> seq.sortedByDescending { it.totalNetworkBytesPerSecond }
+                    ProcessSort.DOWNLOAD -> seq.sortedByDescending { it.rxBytesPerSecond }
+                    ProcessSort.UPLOAD -> seq.sortedByDescending { it.txBytesPerSecond }
                     ProcessSort.NAME -> seq.sortedBy { it.displayName.lowercase() }
                     ProcessSort.PID -> seq.sortedBy { it.pid }
                 }
@@ -392,13 +391,11 @@ private fun ProcessRow(process: ProcessEntry, onClick: (ProcessEntry) -> Unit) {
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
             )
-            if (process.totalNetworkBytesPerSecond > 0L) {
-                Text(
-                    "↓ ${formatSpeed(process.rxBytesPerSecond)}    ↑ ${formatSpeed(process.txBytesPerSecond)}",
-                    style = MaterialTheme.typography.bodySmall,
-                    fontWeight = FontWeight.Medium,
-                )
-            }
+            Text(
+                "↓ ${formatSpeed(process.rxBytesPerSecond)}    ↑ ${formatSpeed(process.txBytesPerSecond)}",
+                style = MaterialTheme.typography.bodySmall,
+                fontWeight = FontWeight.Medium,
+            )
         }
         Column(horizontalAlignment = Alignment.End) {
             Text(String.format(Locale.getDefault(), "%.1f%%", process.cpuPercent))
@@ -485,13 +482,10 @@ private fun NetworkPage(state: TaskManagerUiState) {
                 .padding(horizontal = 12.dp, vertical = 6.dp),
         ) {
             Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                Text("Live app network", style = MaterialTheme.typography.titleMedium)
-                Text(
-                    "↓ ${formatSpeed(network.totalRxBytesPerSecond)}    ↑ ${formatSpeed(network.totalTxBytesPerSecond)}",
-                    fontWeight = FontWeight.SemiBold,
-                )
+                Text("Realtime app speed", style = MaterialTheme.typography.titleMedium)
+                Text("↓ = current download speed   ↑ = current upload speed", style = MaterialTheme.typography.bodySmall)
                 Text("Backend: ${network.backend}", style = MaterialTheme.typography.bodySmall)
-                Text("Network sampling is independent from process refresh.", style = MaterialTheme.typography.bodySmall)
+                Text("Sampling interval: about 1 second; values use the actual elapsed sample time.", style = MaterialTheme.typography.bodySmall)
             }
         }
         if (network.entries.isEmpty()) {
@@ -536,14 +530,14 @@ private fun NetworkRow(entry: NetworkEntry) {
             )
         }
         Column(horizontalAlignment = Alignment.End) {
-            Text("↓ ${formatSpeed(entry.rxBytesPerSecond)}")
+            Text("↓ ${formatSpeed(entry.rxBytesPerSecond)}", fontWeight = FontWeight.Medium)
             Text("↑ ${formatSpeed(entry.txBytesPerSecond)}", style = MaterialTheme.typography.bodySmall)
         }
     }
 }
 
 @Composable
-private fun SectionCard(title: String, content: @Composable Column.() -> Unit) {
+private fun SectionCard(title: String, content: @Composable ColumnScope.() -> Unit) {
     Card(
         modifier = Modifier
             .fillMaxWidth()
@@ -552,10 +546,8 @@ private fun SectionCard(title: String, content: @Composable Column.() -> Unit) {
         Column(
             modifier = Modifier.padding(12.dp),
             verticalArrangement = Arrangement.spacedBy(6.dp),
-        ) {
-            Text(title, style = MaterialTheme.typography.titleMedium)
-            content()
-        }
+            content = content,
+        )
     }
 }
 
@@ -595,11 +587,16 @@ private fun HistoryChart(values: List<Float>) {
         if (values.size < 2) return@Canvas
         val step = size.width / (values.size - 1).coerceAtLeast(1)
         var previousX = 0f
-        var previousY = size.height * (1f - (values.first().coerceIn(0f, 100f) / 100f))
+        var previousY = size.height * (1f - values.first().coerceIn(0f, 100f) / 100f)
         values.drop(1).forEachIndexed { index, value ->
             val x = step * (index + 1)
-            val y = size.height * (1f - (value.coerceIn(0f, 100f) / 100f))
-            drawLine(lineColor, start = androidx.compose.ui.geometry.Offset(previousX, previousY), end = androidx.compose.ui.geometry.Offset(x, y), strokeWidth = 3f)
+            val y = size.height * (1f - value.coerceIn(0f, 100f) / 100f)
+            drawLine(
+                lineColor,
+                start = androidx.compose.ui.geometry.Offset(previousX, previousY),
+                end = androidx.compose.ui.geometry.Offset(x, y),
+                strokeWidth = 3f,
+            )
             previousX = x
             previousY = y
         }
@@ -654,8 +651,8 @@ private fun ProcessDialog(
                 item { CopyDetail("User", process.userName) }
                 item { CopyDetail("CPU Usage", String.format(Locale.getDefault(), "%.1f%%", process.cpuPercent)) }
                 item { CopyDetail("RAM Usage", formatBytes(process.rssKb * 1024L)) }
-                item { CopyDetail("Download", formatSpeed(process.rxBytesPerSecond)) }
-                item { CopyDetail("Upload", formatSpeed(process.txBytesPerSecond)) }
+                item { CopyDetail("Realtime download", formatSpeed(process.rxBytesPerSecond)) }
+                item { CopyDetail("Realtime upload", formatSpeed(process.txBytesPerSecond)) }
                 if (process.virtualMemoryKb > 0L) item { CopyDetail("Virtual Memory", formatBytes(process.virtualMemoryKb * 1024L)) }
                 item { CopyDetail("Foreground", if (process.isForeground) "Yes" else "No") }
                 item { CopyDetail("Threads", process.threads.toString()) }
@@ -752,7 +749,7 @@ private fun SettingsDialog(
                         )
                     }
                 }
-                Text("Network is sampled independently every 1 second.", style = MaterialTheme.typography.bodySmall)
+                Text("Network speed is sampled independently about once per second.", style = MaterialTheme.typography.bodySmall)
             }
         },
         confirmButton = { TextButton(onClick = onDismiss) { Text("Done") } },
@@ -774,7 +771,8 @@ private fun ToggleRow(label: String, checked: Boolean, onCheckedChange: (Boolean
 private fun sortLabel(sort: ProcessSort): String = when (sort) {
     ProcessSort.MEMORY -> "RAM"
     ProcessSort.CPU -> "CPU"
-    ProcessSort.NETWORK -> "NET"
+    ProcessSort.DOWNLOAD -> "↓"
+    ProcessSort.UPLOAD -> "↑"
     ProcessSort.NAME -> "A-Z"
     ProcessSort.PID -> "PID"
 }
