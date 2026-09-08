@@ -5,9 +5,10 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.rk.taskmanager.data.FrameworkRepository
 import com.rk.taskmanager.data.ProcessRepository
+import com.rk.taskmanager.data.SettingsRepository
 import com.rk.taskmanager.data.SystemStatsRepository
 import com.rk.taskmanager.model.ProcessEntry
-import com.rk.taskmanager.model.ProcessFilter
+import com.rk.taskmanager.model.ProcessKind
 import com.rk.taskmanager.model.ProcessSort
 import com.rk.taskmanager.model.RootState
 import com.rk.taskmanager.model.TaskManagerUiState
@@ -25,8 +26,19 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val processRepository = ProcessRepository(application, shell)
     private val statsRepository = SystemStatsRepository(shell)
     private val frameworkRepository = FrameworkRepository(shell)
+    private val settings = SettingsRepository(application)
 
-    private val _state = MutableStateFlow(TaskManagerUiState())
+    private val _state = MutableStateFlow(
+        TaskManagerUiState(
+            sort = settings.sort,
+            showUserApps = settings.showUserApps,
+            showSystemApps = settings.showSystemApps,
+            showLinuxProcesses = settings.showLinuxProcesses,
+            autoRefresh = settings.autoRefresh,
+            refreshIntervalMs = settings.refreshIntervalMs,
+            confirmKill = settings.confirmKill,
+        )
+    )
     val state: StateFlow<TaskManagerUiState> = _state.asStateFlow()
 
     private var monitorJob: Job? = null
@@ -54,18 +66,23 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             if (!rootGranted) return@launch
 
             _state.value = _state.value.copy(framework = frameworkRepository.detect())
+            refreshInternal()
 
             while (isActive) {
-                refreshInternal()
-                delay(1_000)
+                val snapshot = _state.value
+                if (snapshot.autoRefresh) {
+                    delay(snapshot.refreshIntervalMs)
+                    if (isActive && _state.value.autoRefresh) refreshInternal()
+                } else {
+                    delay(250L)
+                }
             }
         }
     }
 
     fun refresh() {
         viewModelScope.launch {
-            if (_state.value.root.granted) refreshInternal()
-            else start()
+            if (_state.value.root.granted) refreshInternal() else start()
         }
     }
 
@@ -74,19 +91,54 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun setSort(sort: ProcessSort) {
+        settings.sort = sort
         _state.value = _state.value.copy(sort = sort)
     }
 
-    fun setFilter(filter: ProcessFilter) {
-        _state.value = _state.value.copy(filter = filter)
+    fun setShowUserApps(value: Boolean) {
+        settings.showUserApps = value
+        _state.value = _state.value.copy(showUserApps = value)
+    }
+
+    fun setShowSystemApps(value: Boolean) {
+        settings.showSystemApps = value
+        _state.value = _state.value.copy(showSystemApps = value)
+    }
+
+    fun setShowLinuxProcesses(value: Boolean) {
+        settings.showLinuxProcesses = value
+        _state.value = _state.value.copy(showLinuxProcesses = value)
+    }
+
+    fun setAutoRefresh(value: Boolean) {
+        settings.autoRefresh = value
+        _state.value = _state.value.copy(autoRefresh = value)
+    }
+
+    fun setRefreshInterval(ms: Long) {
+        settings.refreshIntervalMs = ms
+        _state.value = _state.value.copy(refreshIntervalMs = settings.refreshIntervalMs)
+    }
+
+    fun setConfirmKill(value: Boolean) {
+        settings.confirmKill = value
+        _state.value = _state.value.copy(confirmKill = value)
+    }
+
+    fun togglePin(process: ProcessEntry) {
+        val key = pinKey(process)
+        val pinned = settings.togglePinned(key)
+        _state.value = _state.value.copy(
+            processes = _state.value.processes.map {
+                if (it.pid == process.pid) it.copy(isPinned = pinned) else it
+            }
+        )
     }
 
     fun killProcess(process: ProcessEntry) {
         viewModelScope.launch {
             val ok = processRepository.killProcess(process.pid)
-            if (!ok) {
-                _state.value = _state.value.copy(error = "Failed to kill PID ${process.pid}")
-            }
+            if (!ok) _state.value = _state.value.copy(error = "Failed to kill PID ${process.pid}")
             refreshInternal()
         }
     }
@@ -95,9 +147,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val pkg = process.packageName ?: return
         viewModelScope.launch {
             val ok = processRepository.forceStop(pkg)
-            if (!ok) {
-                _state.value = _state.value.copy(error = "Failed to force-stop $pkg")
-            }
+            if (!ok) _state.value = _state.value.copy(error = "Failed to force-stop $pkg")
             refreshInternal()
         }
     }
@@ -109,10 +159,15 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private suspend fun refreshInternal() {
         runCatching {
             val system = statsRepository.read()
-            val processes = processRepository.listProcesses()
+            val pinned = settings.pinnedProcesses
+            val processes = processRepository.listProcesses().map { process ->
+                process.copy(isPinned = pinKey(process) in pinned)
+            }
             _state.value = _state.value.copy(
                 system = system,
                 processes = processes,
+                processCount = processes.size,
+                threadCount = processes.sumOf { it.threads },
                 loading = false,
                 error = null
             )
@@ -123,6 +178,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             )
         }
     }
+
+    private fun pinKey(process: ProcessEntry): String =
+        process.packageName ?: process.command.ifBlank { "pid:${process.pid}" }
 
     override fun onCleared() {
         monitorJob?.cancel()

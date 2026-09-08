@@ -33,12 +33,14 @@ class ProcessRepository(
               statline=$(cat "${'$'}p/stat" 2>/dev/null) || continue
               uid=$(awk '/^Uid:/{print ${'$'}2; exit}' "${'$'}p/status" 2>/dev/null)
               rss=$(awk '/^VmRSS:/{print ${'$'}2; exit}' "${'$'}p/status" 2>/dev/null)
+              vmsize=$(awk '/^VmSize:/{print ${'$'}2; exit}' "${'$'}p/status" 2>/dev/null)
               threads=$(awk '/^Threads:/{print ${'$'}2; exit}' "${'$'}p/status" 2>/dev/null)
               user=$(stat -c %U "${'$'}p" 2>/dev/null)
               oom=$(cat "${'$'}p/oom_score_adj" 2>/dev/null)
               cmd=$(tr '\000\t\r\n' '    ' < "${'$'}p/cmdline" 2>/dev/null | sed 's/[[:space:]]\+/ /g; s/^ //; s/ ${'$'}//')
-              exe=$(readlink "${'$'}p/exe" 2>/dev/null | tr '\t\r\n' '   ')
-              printf '__PROC__|%s|%s|%s|%s|%s|%s|%s|%s\n' "${'$'}pid" "${'$'}uid" "${'$'}rss" "${'$'}threads" "${'$'}user" "${'$'}oom" "${'$'}cmd" "${'$'}exe"
+              exe=$(readlink "${'$'}p/exe" 2>/dev/null | tr '\t\r\n|' '    ')
+              cgroup=$(tr '\n\t\r|' '    ' < "${'$'}p/cgroup" 2>/dev/null | sed 's/[[:space:]]\+/ /g; s/^ //; s/ ${'$'}//')
+              printf '__PROC__|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' "${'$'}pid" "${'$'}uid" "${'$'}rss" "${'$'}vmsize" "${'$'}threads" "${'$'}user" "${'$'}oom" "${'$'}cmd" "${'$'}exe" "${'$'}cgroup"
               printf '__STAT__|%s\n' "${'$'}statline"
             done
         """.trimIndent()
@@ -61,8 +63,7 @@ class ProcessRepository(
 
     private fun parseProcDump(text: String): List<ProcessEntry> {
         val lines = text.lineSequence().toList()
-        val meta = lines.firstOrNull { it.startsWith("__META__|") }
-            ?.split('|')
+        val meta = lines.firstOrNull { it.startsWith("__META__|") }?.split('|')
         clockTicksPerSecond = meta?.getOrNull(1)?.toLongOrNull()?.coerceAtLeast(1L) ?: 100L
         val uptimeSeconds = meta?.getOrNull(2)?.toDoubleOrNull() ?: 0.0
 
@@ -84,7 +85,7 @@ class ProcessRepository(
                 continue
             }
 
-            val proc = procLine.split('|', limit = 9)
+            val proc = procLine.split('|', limit = 11)
             val pid = proc.getOrNull(1)?.toIntOrNull()
             val stat = parseStat(statLine.removePrefix("__STAT__|"))
             if (pid == null || stat == null || stat.pid != pid) {
@@ -94,11 +95,13 @@ class ProcessRepository(
 
             val uid = proc.getOrNull(2)?.toIntOrNull() ?: -1
             val rssKb = proc.getOrNull(3)?.toLongOrNull() ?: 0L
-            val threads = proc.getOrNull(4)?.toIntOrNull() ?: stat.threads
-            val userName = proc.getOrNull(5).orEmpty().ifBlank { uid.toString() }
-            val oom = proc.getOrNull(6)?.toIntOrNull()
-            val command = proc.getOrNull(7).orEmpty().ifBlank { stat.name }
-            val exe = proc.getOrNull(8)?.takeIf { it.isNotBlank() }
+            val virtualMemoryKb = proc.getOrNull(4)?.toLongOrNull() ?: 0L
+            val threads = proc.getOrNull(5)?.toIntOrNull() ?: stat.threads
+            val userName = proc.getOrNull(6).orEmpty().ifBlank { uid.toString() }
+            val oom = proc.getOrNull(7)?.toIntOrNull()
+            val command = proc.getOrNull(8).orEmpty().ifBlank { stat.name }
+            val exe = proc.getOrNull(9)?.takeIf { it.isNotBlank() }
+            val cgroup = proc.getOrNull(10)?.takeIf { it.isNotBlank() }
 
             val totalTicks = stat.userTicks + stat.systemTicks
             newTicks[pid] = totalTicks
@@ -123,9 +126,6 @@ class ProcessRepository(
                 else -> ProcessKind.USER_APP
             }
 
-            // oom_score_adj <= 0 is a useful low-level approximation for foreground/
-            // perceptible importance. The LSPosed system_server layer can later replace
-            // this with ActivityManager process-state information for exact Android state.
             val foreground = identities.isNotEmpty() && (oom?.let { it <= 0 } == true)
 
             result += ProcessEntry(
@@ -136,10 +136,12 @@ class ProcessRepository(
                 nice = stat.nice,
                 state = stat.state,
                 rssKb = rssKb,
+                virtualMemoryKb = virtualMemoryKb,
                 cpuPercent = cpuPercent,
                 name = stat.name,
                 command = command,
                 executablePath = exe,
+                cgroup = cgroup,
                 threads = threads,
                 startTimeMillis = startTimeMillis,
                 elapsedTimeMillis = elapsedMs,

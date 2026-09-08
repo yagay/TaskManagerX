@@ -19,8 +19,10 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Memory
+import androidx.compose.material.icons.filled.PushPin
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.Button
@@ -37,6 +39,7 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
@@ -58,7 +61,6 @@ import androidx.compose.ui.unit.dp
 import androidx.core.graphics.drawable.toBitmap
 import com.rk.taskmanager.MainViewModel
 import com.rk.taskmanager.model.ProcessEntry
-import com.rk.taskmanager.model.ProcessFilter
 import com.rk.taskmanager.model.ProcessKind
 import com.rk.taskmanager.model.ProcessSort
 import com.rk.taskmanager.model.TaskManagerUiState
@@ -73,6 +75,8 @@ fun TaskManagerApp(viewModel: MainViewModel) {
     val state by viewModel.state.collectAsState()
     val snackbar = remember { SnackbarHostState() }
     var selected by remember { mutableStateOf<ProcessEntry?>(null) }
+    var showSettings by remember { mutableStateOf(false) }
+    var pendingKill by remember { mutableStateOf<Pair<ProcessEntry, Boolean>?>(null) }
 
     LaunchedEffect(state.error) {
         state.error?.let {
@@ -84,10 +88,21 @@ fun TaskManagerApp(viewModel: MainViewModel) {
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("TaskManagerX") },
+                title = {
+                    Column {
+                        Text("TaskManagerX")
+                        Text(
+                            "${state.processCount} processes • ${state.threadCount} threads",
+                            style = MaterialTheme.typography.labelSmall
+                        )
+                    }
+                },
                 actions = {
                     IconButton(onClick = viewModel::refresh) {
                         Icon(Icons.Default.Refresh, contentDescription = "Refresh")
+                    }
+                    IconButton(onClick = { showSettings = true }) {
+                        Icon(Icons.Default.Settings, contentDescription = "Settings")
                     }
                 }
             )
@@ -102,12 +117,12 @@ fun TaskManagerApp(viewModel: MainViewModel) {
             StatusSection(state)
             SystemSection(state)
             FilterSection(
-                query = state.query,
-                sort = state.sort,
-                filter = state.filter,
+                state = state,
                 onQuery = viewModel::setQuery,
                 onSort = viewModel::setSort,
-                onFilter = viewModel::setFilter,
+                onShowUser = viewModel::setShowUserApps,
+                onShowSystem = viewModel::setShowSystemApps,
+                onShowLinux = viewModel::setShowLinuxProcesses,
             )
 
             if (state.loading) {
@@ -124,14 +139,49 @@ fun TaskManagerApp(viewModel: MainViewModel) {
         ProcessDialog(
             process = process,
             onDismiss = { selected = null },
+            onPin = { viewModel.togglePin(process) },
             onKill = {
-                selected = null
-                viewModel.killProcess(process)
+                if (state.confirmKill) pendingKill = process to false
+                else {
+                    selected = null
+                    viewModel.killProcess(process)
+                }
             },
             onForceStop = {
-                selected = null
-                viewModel.forceStop(process)
+                if (state.confirmKill) pendingKill = process to true
+                else {
+                    selected = null
+                    viewModel.forceStop(process)
+                }
             }
+        )
+    }
+
+    pendingKill?.let { (process, forceStop) ->
+        AlertDialog(
+            onDismissRequest = { pendingKill = null },
+            title = { Text(if (forceStop) "Force stop app?" else "Kill process?") },
+            text = { Text(process.displayName) },
+            confirmButton = {
+                Button(onClick = {
+                    pendingKill = null
+                    selected = null
+                    if (forceStop) viewModel.forceStop(process) else viewModel.killProcess(process)
+                }) { Text("Confirm") }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingKill = null }) { Text("Cancel") }
+            }
+        )
+    }
+
+    if (showSettings) {
+        SettingsDialog(
+            state = state,
+            onDismiss = { showSettings = false },
+            onAutoRefresh = viewModel::setAutoRefresh,
+            onRefreshInterval = viewModel::setRefreshInterval,
+            onConfirmKill = viewModel::setConfirmKill,
         )
     }
 }
@@ -177,13 +227,16 @@ private fun SystemSection(state: TaskManagerUiState) {
             } else 0f
         )
     }
-    if (s.swapTotalBytes > 0L) {
-        Text(
-            "SWAP ${formatBytes(s.swapUsedBytes)} / ${formatBytes(s.swapTotalBytes)}  •  Load ${String.format(Locale.getDefault(), "%.2f", s.load1)}",
-            modifier = Modifier.padding(horizontal = 14.dp, vertical = 4.dp),
-            style = MaterialTheme.typography.bodySmall
-        )
-    }
+    Text(
+        buildString {
+            if (s.swapTotalBytes > 0L) {
+                append("SWAP ${formatBytes(s.swapUsedBytes)} / ${formatBytes(s.swapTotalBytes)}  •  ")
+            }
+            append("Load ${String.format(Locale.getDefault(), "%.2f", s.load1)}")
+        },
+        modifier = Modifier.padding(horizontal = 14.dp, vertical = 4.dp),
+        style = MaterialTheme.typography.bodySmall
+    )
 }
 
 @Composable
@@ -204,22 +257,22 @@ private fun MetricCard(modifier: Modifier, title: String, value: String, progres
 
 @Composable
 private fun FilterSection(
-    query: String,
-    sort: ProcessSort,
-    filter: ProcessFilter,
+    state: TaskManagerUiState,
     onQuery: (String) -> Unit,
     onSort: (ProcessSort) -> Unit,
-    onFilter: (ProcessFilter) -> Unit,
+    onShowUser: (Boolean) -> Unit,
+    onShowSystem: (Boolean) -> Unit,
+    onShowLinux: (Boolean) -> Unit,
 ) {
     Column(Modifier.padding(horizontal = 12.dp, vertical = 8.dp)) {
         OutlinedTextField(
-            value = query,
+            value = state.query,
             onValueChange = onQuery,
             modifier = Modifier.fillMaxWidth(),
             singleLine = true,
             leadingIcon = { Icon(Icons.Default.Search, contentDescription = null) },
             trailingIcon = {
-                if (query.isNotEmpty()) {
+                if (state.query.isNotEmpty()) {
                     IconButton(onClick = { onQuery("") }) {
                         Icon(Icons.Default.Close, contentDescription = "Clear")
                     }
@@ -229,20 +282,28 @@ private fun FilterSection(
         )
         Spacer(Modifier.height(6.dp))
         Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-            ProcessFilter.entries.forEach { item ->
-                FilterChip(
-                    selected = filter == item,
-                    onClick = { onFilter(item) },
-                    label = { Text(filterLabel(item)) }
-                )
-            }
+            FilterChip(
+                selected = state.showUserApps,
+                onClick = { onShowUser(!state.showUserApps) },
+                label = { Text("User") }
+            )
+            FilterChip(
+                selected = state.showSystemApps,
+                onClick = { onShowSystem(!state.showSystemApps) },
+                label = { Text("System") }
+            )
+            FilterChip(
+                selected = state.showLinuxProcesses,
+                onClick = { onShowLinux(!state.showLinuxProcesses) },
+                label = { Text("Linux") }
+            )
         }
         Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
             ProcessSort.entries.forEach { item ->
                 FilterChip(
-                    selected = sort == item,
+                    selected = state.sort == item,
                     onClick = { onSort(item) },
-                    label = { Text(item.name) }
+                    label = { Text(sortLabel(item)) }
                 )
             }
         }
@@ -251,15 +312,21 @@ private fun FilterSection(
 
 @Composable
 private fun ProcessList(state: TaskManagerUiState, onClick: (ProcessEntry) -> Unit) {
-    val filtered = remember(state.processes, state.query, state.sort, state.filter) {
+    val filtered = remember(
+        state.processes,
+        state.query,
+        state.sort,
+        state.showUserApps,
+        state.showSystemApps,
+        state.showLinuxProcesses
+    ) {
         state.processes
             .asSequence()
             .filter {
-                when (state.filter) {
-                    ProcessFilter.ALL -> true
-                    ProcessFilter.USER_APPS -> it.kind == ProcessKind.USER_APP
-                    ProcessFilter.SYSTEM_APPS -> it.kind == ProcessKind.SYSTEM_APP
-                    ProcessFilter.LINUX -> it.kind == ProcessKind.LINUX
+                when (it.kind) {
+                    ProcessKind.USER_APP -> state.showUserApps
+                    ProcessKind.SYSTEM_APP -> state.showSystemApps
+                    ProcessKind.LINUX -> state.showLinuxProcesses
                 }
             }
             .filter {
@@ -280,6 +347,7 @@ private fun ProcessList(state: TaskManagerUiState, onClick: (ProcessEntry) -> Un
                     ProcessSort.PID -> sequence.sortedBy { it.pid }
                 }
             }
+            .sortedByDescending { it.isPinned }
             .toList()
     }
 
@@ -311,8 +379,11 @@ private fun ProcessRow(process: ProcessEntry, onClick: (ProcessEntry) -> Unit) {
                     overflow = TextOverflow.Ellipsis,
                     modifier = Modifier.weight(1f)
                 )
+                if (process.isPinned) {
+                    Icon(Icons.Default.PushPin, contentDescription = "Pinned", modifier = Modifier.size(15.dp))
+                }
                 if (process.isForeground) {
-                    Text("FG", style = MaterialTheme.typography.labelSmall)
+                    Text(" FG", style = MaterialTheme.typography.labelSmall)
                 }
             }
             Text(
@@ -359,6 +430,7 @@ private fun AppIcon(drawable: Drawable?) {
 private fun ProcessDialog(
     process: ProcessEntry,
     onDismiss: () -> Unit,
+    onPin: () -> Unit,
     onKill: () -> Unit,
     onForceStop: () -> Unit,
 ) {
@@ -372,7 +444,10 @@ private fun ProcessDialog(
                 item { Detail("UID", process.uid.toString()) }
                 item { Detail("User", process.userName) }
                 item { Detail("CPU Usage", String.format(Locale.getDefault(), "%.1f%%", process.cpuPercent)) }
-                item { Detail("Actual RAM (RSS)", formatBytes(process.rssKb * 1024L)) }
+                item { Detail("RAM Usage", formatBytes(process.rssKb * 1024L)) }
+                if (process.virtualMemoryKb > 0L) {
+                    item { Detail("Virtual Memory", formatBytes(process.virtualMemoryKb * 1024L)) }
+                }
                 item { Detail("Foreground", if (process.isForeground) "Yes" else "No") }
                 item { Detail("Threads", process.threads.toString()) }
                 item { Detail("Nice Value", process.nice.toString()) }
@@ -380,6 +455,7 @@ private fun ProcessDialog(
                 item { Detail("Start Time", formatStartTime(process.startTimeMillis)) }
                 item { Detail("Elapsed Time", formatDuration(process.elapsedTimeMillis)) }
                 process.executablePath?.let { path -> item { Detail("Executable Path", path) } }
+                process.cgroup?.let { value -> item { Detail("Cgroup", value) } }
                 if (process.packageNames.isNotEmpty()) {
                     item { Detail("Package", process.packageNames.joinToString("\n")) }
                 }
@@ -389,6 +465,9 @@ private fun ProcessDialog(
         },
         confirmButton = {
             Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                TextButton(onClick = onPin) {
+                    Text(if (process.isPinned) "Unpin" else "Pin")
+                }
                 if (process.packageName != null) {
                     Button(onClick = onForceStop) { Text("Force stop") }
                 }
@@ -402,15 +481,60 @@ private fun ProcessDialog(
 }
 
 @Composable
+private fun SettingsDialog(
+    state: TaskManagerUiState,
+    onDismiss: () -> Unit,
+    onAutoRefresh: (Boolean) -> Unit,
+    onRefreshInterval: (Long) -> Unit,
+    onConfirmKill: (Boolean) -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Process settings") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                ToggleRow("Auto refresh", state.autoRefresh, onAutoRefresh)
+                ToggleRow("Confirm before kill", state.confirmKill, onConfirmKill)
+                Text("Refresh interval", style = MaterialTheme.typography.labelLarge)
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    listOf(500L, 800L, 1000L, 2000L).forEach { value ->
+                        FilterChip(
+                            selected = state.refreshIntervalMs == value,
+                            onClick = { onRefreshInterval(value) },
+                            label = { Text("${value}ms") }
+                        )
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onDismiss) { Text("Done") }
+        }
+    )
+}
+
+@Composable
+private fun ToggleRow(label: String, checked: Boolean, onCheckedChange: (Boolean) -> Unit) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.SpaceBetween
+    ) {
+        Text(label)
+        Switch(checked = checked, onCheckedChange = onCheckedChange)
+    }
+}
+
+@Composable
 private fun Detail(label: String, value: String) {
     Text("$label: $value", style = MaterialTheme.typography.bodyMedium)
 }
 
-private fun filterLabel(filter: ProcessFilter): String = when (filter) {
-    ProcessFilter.ALL -> "All"
-    ProcessFilter.USER_APPS -> "User"
-    ProcessFilter.SYSTEM_APPS -> "System"
-    ProcessFilter.LINUX -> "Linux"
+private fun sortLabel(sort: ProcessSort): String = when (sort) {
+    ProcessSort.MEMORY -> "RAM"
+    ProcessSort.CPU -> "CPU"
+    ProcessSort.NAME -> "A-Z"
+    ProcessSort.PID -> "PID"
 }
 
 private fun kindLabel(kind: ProcessKind): String = when (kind) {

@@ -36,10 +36,12 @@ data class ProcessEntry(
     val nice: Int,
     val state: String,
     val rssKb: Long,
+    val virtualMemoryKb: Long = 0L,
     val cpuPercent: Float,
     val name: String,
     val command: String,
     val executablePath: String? = null,
+    val cgroup: String? = null,
     val threads: Int = 0,
     val startTimeMillis: Long = 0L,
     val elapsedTimeMillis: Long = 0L,
@@ -50,6 +52,7 @@ data class ProcessEntry(
     val appLabel: String? = null,
     val icon: Drawable? = null,
     val kind: ProcessKind = ProcessKind.LINUX,
+    val isPinned: Boolean = false,
 ) {
     val displayName: String
         get() = appLabel?.takeIf { it.isNotBlank() }
@@ -58,11 +61,7 @@ data class ProcessEntry(
 }
 
 enum class ProcessSort {
-    CPU, MEMORY, NAME, PID
-}
-
-enum class ProcessFilter {
-    ALL, USER_APPS, SYSTEM_APPS, LINUX
+    MEMORY, CPU, NAME, PID
 }
 
 data class TaskManagerUiState(
@@ -72,7 +71,14 @@ data class TaskManagerUiState(
     val processes: List<ProcessEntry> = emptyList(),
     val loading: Boolean = true,
     val query: String = "",
-    val sort: ProcessSort = ProcessSort.CPU,
-    val filter: ProcessFilter = ProcessFilter.ALL,
+    val sort: ProcessSort = ProcessSort.MEMORY,
+    val showUserApps: Boolean = true,
+    val showSystemApps: Boolean = true,
+    val showLinuxProcesses: Boolean = false,
+    val autoRefresh: Boolean = true,
+    val refreshIntervalMs: Long = 800L,
+    val confirmKill: Boolean = true,
+    val processCount: Int = 0,
+    val threadCount: Int = 0,
     val error: String? = null,
 )
