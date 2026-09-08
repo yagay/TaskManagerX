@@ -2,6 +2,7 @@ package com.rk.taskmanager.ui
 
 import android.graphics.drawable.Drawable
 import android.widget.Toast
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.combinedClickable
@@ -35,7 +36,6 @@ import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
-import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
@@ -56,6 +56,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
@@ -105,7 +106,7 @@ fun TaskManagerApp(viewModel: MainViewModel) {
                             when (page) {
                                 HomePage.PROCESSES -> "${state.processCount} processes • ${state.threadCount} threads"
                                 HomePage.RESOURCES -> "CPU • RAM • GPU"
-                                HomePage.NETWORK -> "All active app traffic"
+                                HomePage.NETWORK -> "↓ ${formatSpeed(state.network.totalRxBytesPerSecond)}  ↑ ${formatSpeed(state.network.totalTxBytesPerSecond)}"
                             },
                             style = MaterialTheme.typography.labelSmall,
                         )
@@ -128,9 +129,15 @@ fun TaskManagerApp(viewModel: MainViewModel) {
                 .padding(padding)
                 .fillMaxSize(),
         ) {
-            PageSelector(page = page, onPage = { page = it })
+            PageSelector(page) { page = it }
             when (page) {
-                HomePage.PROCESSES -> ProcessPage(state, viewModel, onSelect = { selected = it })
+                HomePage.PROCESSES -> ProcessPage(
+                    state = state,
+                    viewModel = viewModel,
+                    onSelect = { process ->
+                        viewModel.loadProcessDetails(process) { selected = it }
+                    },
+                )
                 HomePage.RESOURCES -> ResourcePage(state)
                 HomePage.NETWORK -> NetworkPage(state)
             }
@@ -142,7 +149,9 @@ fun TaskManagerApp(viewModel: MainViewModel) {
             process = process,
             parent = state.processes.firstOrNull { it.pid == process.ppid },
             onDismiss = { selected = null },
-            onOpenParent = { selected = it },
+            onOpenParent = { parent ->
+                viewModel.loadProcessDetails(parent) { selected = it }
+            },
             onPin = { viewModel.togglePin(process) },
             onKill = {
                 if (state.confirmKill) pendingKill = process to false
@@ -167,13 +176,11 @@ fun TaskManagerApp(viewModel: MainViewModel) {
             title = { Text(if (forceStop) "Force stop app?" else "Kill process?") },
             text = { Text(process.displayName) },
             confirmButton = {
-                Button(
-                    onClick = {
-                        pendingKill = null
-                        selected = null
-                        if (forceStop) viewModel.forceStop(process) else viewModel.killProcess(process)
-                    },
-                ) { Text("Confirm") }
+                Button(onClick = {
+                    pendingKill = null
+                    selected = null
+                    if (forceStop) viewModel.forceStop(process) else viewModel.killProcess(process)
+                }) { Text("Confirm") }
             },
             dismissButton = {
                 TextButton(onClick = { pendingKill = null }) { Text("Cancel") }
@@ -252,16 +259,11 @@ private fun StatusSection(state: TaskManagerUiState) {
             .padding(horizontal = 12.dp, vertical = 2.dp),
         horizontalArrangement = Arrangement.spacedBy(8.dp),
     ) {
-        AssistChip(
-            onClick = {},
-            label = { Text(if (state.root.granted) "Root: OK" else "Root: unavailable") },
-        )
-        AssistChip(
-            onClick = {},
-            label = {
-                Text(if (state.framework.detected) "LSPosed: detected" else "LSPosed: not detected")
-            },
-        )
+        AssistChip(onClick = {}, label = { Text(if (state.root.granted) "Root: OK" else "Root: unavailable") })
+        AssistChip(onClick = {}, label = { Text(if (state.framework.detected) "LSPosed: detected" else "LSPosed: not detected") })
+        if (state.network.backend != "Not sampled") {
+            AssistChip(onClick = {}, label = { Text(state.network.backend) })
+        }
     }
 }
 
@@ -292,21 +294,9 @@ private fun FilterSection(
         )
         Spacer(Modifier.height(6.dp))
         Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-            FilterChip(
-                selected = state.showUserApps,
-                onClick = { onUser(!state.showUserApps) },
-                label = { Text("User") },
-            )
-            FilterChip(
-                selected = state.showSystemApps,
-                onClick = { onSystem(!state.showSystemApps) },
-                label = { Text("System") },
-            )
-            FilterChip(
-                selected = state.showLinuxProcesses,
-                onClick = { onLinux(!state.showLinuxProcesses) },
-                label = { Text("Linux") },
-            )
+            FilterChip(state.showUserApps, { onUser(!state.showUserApps) }, label = { Text("User") })
+            FilterChip(state.showSystemApps, { onSystem(!state.showSystemApps) }, label = { Text("System") })
+            FilterChip(state.showLinuxProcesses, { onLinux(!state.showLinuxProcesses) }, label = { Text("Linux") })
         }
         Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
             ProcessSort.entries.forEach { item ->
@@ -353,6 +343,7 @@ private fun ProcessList(state: TaskManagerUiState, onClick: (ProcessEntry) -> Un
                 when (state.sort) {
                     ProcessSort.CPU -> seq.sortedByDescending { it.cpuPercent }
                     ProcessSort.MEMORY -> seq.sortedByDescending { it.rssKb }
+                    ProcessSort.NETWORK -> seq.sortedByDescending { it.totalNetworkBytesPerSecond }
                     ProcessSort.NAME -> seq.sortedBy { it.displayName.lowercase() }
                     ProcessSort.PID -> seq.sortedBy { it.pid }
                 }
@@ -376,7 +367,7 @@ private fun ProcessRow(process: ProcessEntry, onClick: (ProcessEntry) -> Unit) {
         modifier = Modifier
             .fillMaxWidth()
             .combinedClickable(onClick = { onClick(process) })
-            .padding(horizontal = 12.dp, vertical = 9.dp),
+            .padding(horizontal = 12.dp, vertical = 8.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         AppIcon(process.icon)
@@ -393,15 +384,21 @@ private fun ProcessRow(process: ProcessEntry, onClick: (ProcessEntry) -> Unit) {
                 if (process.isPinned) {
                     Icon(Icons.Default.PushPin, contentDescription = "Pinned", modifier = Modifier.size(15.dp))
                 }
-                if (process.isForeground) {
-                    Text(" FG", style = MaterialTheme.typography.labelSmall)
-                }
+                if (process.isForeground) Text(" FG", style = MaterialTheme.typography.labelSmall)
             }
             Text(
                 "PID ${process.pid}  ${process.userName}  ${kindLabel(process.kind)}  ${process.threads}T",
                 style = MaterialTheme.typography.bodySmall,
                 maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
             )
+            if (process.totalNetworkBytesPerSecond > 0L) {
+                Text(
+                    "↓ ${formatSpeed(process.rxBytesPerSecond)}    ↑ ${formatSpeed(process.txBytesPerSecond)}",
+                    style = MaterialTheme.typography.bodySmall,
+                    fontWeight = FontWeight.Medium,
+                )
+            }
         }
         Column(horizontalAlignment = Alignment.End) {
             Text(String.format(Locale.getDefault(), "%.1f%%", process.cpuPercent))
@@ -455,11 +452,8 @@ private fun ResourcePage(state: TaskManagerUiState) {
         }
         item {
             SectionCard("CPU frequencies") {
-                if (s.cpuCores.isEmpty()) {
-                    Text("No cpufreq data", style = MaterialTheme.typography.bodySmall)
-                } else {
-                    s.cpuCores.forEach { core -> CpuCoreRow(core) }
-                }
+                if (s.cpuCores.isEmpty()) Text("No cpufreq data", style = MaterialTheme.typography.bodySmall)
+                else s.cpuCores.forEach { CpuCoreRow(it) }
             }
         }
         item {
@@ -491,16 +485,15 @@ private fun NetworkPage(state: TaskManagerUiState) {
                 .padding(horizontal = 12.dp, vertical = 6.dp),
         ) {
             Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                Text("Live network", style = MaterialTheme.typography.titleMedium)
+                Text("Live app network", style = MaterialTheme.typography.titleMedium)
                 Text(
                     "↓ ${formatSpeed(network.totalRxBytesPerSecond)}    ↑ ${formatSpeed(network.totalTxBytesPerSecond)}",
                     fontWeight = FontWeight.SemiBold,
                 )
                 Text("Backend: ${network.backend}", style = MaterialTheme.typography.bodySmall)
-                Text("Only UIDs with traffic in the latest sample are shown.", style = MaterialTheme.typography.bodySmall)
+                Text("Network sampling is independent from process refresh.", style = MaterialTheme.typography.bodySmall)
             }
         }
-
         if (network.entries.isEmpty()) {
             Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                 Text("No active app traffic yet")
@@ -527,12 +520,7 @@ private fun NetworkRow(entry: NetworkEntry) {
         AppIcon(entry.icon)
         Spacer(Modifier.size(10.dp))
         Column(Modifier.weight(1f)) {
-            Text(
-                entry.label,
-                fontWeight = FontWeight.Medium,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
+            Text(entry.label, fontWeight = FontWeight.Medium, maxLines = 1, overflow = TextOverflow.Ellipsis)
             Text(
                 buildString {
                     append("UID ${entry.uid}")
@@ -579,12 +567,7 @@ private fun MetricLine(label: String, value: String) {
         verticalAlignment = Alignment.Top,
     ) {
         Text(label, style = MaterialTheme.typography.bodySmall)
-        Text(
-            value,
-            style = MaterialTheme.typography.bodySmall,
-            maxLines = 2,
-            overflow = TextOverflow.Ellipsis,
-        )
+        Text(value, style = MaterialTheme.typography.bodySmall, maxLines = 2, overflow = TextOverflow.Ellipsis)
     }
 }
 
@@ -596,6 +579,30 @@ private fun CpuCoreRow(core: CpuCoreInfo) {
             "${formatKHz(core.minKHz)} / ${formatKHz(core.currentKHz)} / ${formatKHz(core.maxKHz)}   min/current/max",
             style = MaterialTheme.typography.bodySmall,
         )
+    }
+}
+
+@Composable
+private fun HistoryChart(values: List<Float>) {
+    val lineColor = MaterialTheme.colorScheme.primary
+    val guideColor = MaterialTheme.colorScheme.outlineVariant
+    Canvas(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(72.dp),
+    ) {
+        drawRect(guideColor, style = Stroke(width = 1f))
+        if (values.size < 2) return@Canvas
+        val step = size.width / (values.size - 1).coerceAtLeast(1)
+        var previousX = 0f
+        var previousY = size.height * (1f - (values.first().coerceIn(0f, 100f) / 100f))
+        values.drop(1).forEachIndexed { index, value ->
+            val x = step * (index + 1)
+            val y = size.height * (1f - (value.coerceIn(0f, 100f) / 100f))
+            drawLine(lineColor, start = androidx.compose.ui.geometry.Offset(previousX, previousY), end = androidx.compose.ui.geometry.Offset(x, y), strokeWidth = 3f)
+            previousX = x
+            previousY = y
+        }
     }
 }
 
@@ -612,7 +619,6 @@ private fun AppIcon(drawable: Drawable?) {
         }
         return
     }
-
     val density = LocalDensity.current
     val px = with(density) { 40.dp.roundToPx() }
     val bitmap = remember(drawable, px) {
@@ -627,7 +633,6 @@ private fun AppIcon(drawable: Drawable?) {
     )
 }
 
-@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun ProcessDialog(
     process: ProcessEntry,
@@ -644,16 +649,14 @@ private fun ProcessDialog(
         text = {
             LazyColumn(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                 item { CopyDetail("PID", process.pid.toString()) }
-                if (process.ppid != 0) {
-                    item { ParentDetail(process.ppid, parent, onOpenParent) }
-                }
+                if (process.ppid != 0) item { ParentDetail(process.ppid, parent, onOpenParent) }
                 item { CopyDetail("UID", process.uid.toString()) }
                 item { CopyDetail("User", process.userName) }
                 item { CopyDetail("CPU Usage", String.format(Locale.getDefault(), "%.1f%%", process.cpuPercent)) }
                 item { CopyDetail("RAM Usage", formatBytes(process.rssKb * 1024L)) }
-                if (process.virtualMemoryKb > 0L) {
-                    item { CopyDetail("Virtual Memory", formatBytes(process.virtualMemoryKb * 1024L)) }
-                }
+                item { CopyDetail("Download", formatSpeed(process.rxBytesPerSecond)) }
+                item { CopyDetail("Upload", formatSpeed(process.txBytesPerSecond)) }
+                if (process.virtualMemoryKb > 0L) item { CopyDetail("Virtual Memory", formatBytes(process.virtualMemoryKb * 1024L)) }
                 item { CopyDetail("Foreground", if (process.isForeground) "Yes" else "No") }
                 item { CopyDetail("Threads", process.threads.toString()) }
                 item { CopyDetail("Nice Value", process.nice.toString()) }
@@ -662,9 +665,7 @@ private fun ProcessDialog(
                 item { CopyDetail("Elapsed Time", formatDuration(process.elapsedTimeMillis)) }
                 process.executablePath?.let { value -> item { CopyDetail("Executable Path", value) } }
                 process.cgroup?.let { value -> item { CopyDetail("Cgroup", value) } }
-                if (process.packageNames.isNotEmpty()) {
-                    item { CopyDetail("Package", process.packageNames.joinToString("\n")) }
-                }
+                if (process.packageNames.isNotEmpty()) item { CopyDetail("Package", process.packageNames.joinToString("\n")) }
                 item { CopyDetail("Command", process.command) }
                 process.oomScoreAdj?.let { value -> item { CopyDetail("OOM score adj", value.toString()) } }
             }
@@ -672,9 +673,7 @@ private fun ProcessDialog(
         confirmButton = {
             Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                 TextButton(onClick = onPin) { Text(if (process.isPinned) "Unpin" else "Pin") }
-                if (process.packageName != null) {
-                    Button(onClick = onForceStop) { Text("Force stop") }
-                }
+                if (process.packageName != null) Button(onClick = onForceStop) { Text("Force stop") }
                 Button(onClick = onKill) { Text("Kill PID") }
             }
         },
@@ -701,12 +700,7 @@ private fun CopyDetail(label: String, value: String) {
         horizontalArrangement = Arrangement.SpaceBetween,
     ) {
         Text(label, style = MaterialTheme.typography.bodySmall)
-        Text(
-            value,
-            style = MaterialTheme.typography.bodySmall,
-            maxLines = 2,
-            overflow = TextOverflow.Ellipsis,
-        )
+        Text(value, style = MaterialTheme.typography.bodySmall, maxLines = 2, overflow = TextOverflow.Ellipsis)
     }
 }
 
@@ -729,10 +723,7 @@ private fun ParentDetail(ppid: Int, parent: ProcessEntry?, onOpenParent: (Proces
         horizontalArrangement = Arrangement.SpaceBetween,
     ) {
         Text("Parent PID", style = MaterialTheme.typography.bodySmall)
-        Text(
-            if (parent != null) "$ppid ›" else "$ppid (not found)",
-            style = MaterialTheme.typography.bodySmall,
-        )
+        Text(if (parent != null) "$ppid ›" else "$ppid (not found)", style = MaterialTheme.typography.bodySmall)
     }
 }
 
@@ -761,6 +752,7 @@ private fun SettingsDialog(
                         )
                     }
                 }
+                Text("Network is sampled independently every 1 second.", style = MaterialTheme.typography.bodySmall)
             }
         },
         confirmButton = { TextButton(onClick = onDismiss) { Text("Done") } },
@@ -782,6 +774,7 @@ private fun ToggleRow(label: String, checked: Boolean, onCheckedChange: (Boolean
 private fun sortLabel(sort: ProcessSort): String = when (sort) {
     ProcessSort.MEMORY -> "RAM"
     ProcessSort.CPU -> "CPU"
+    ProcessSort.NETWORK -> "NET"
     ProcessSort.NAME -> "A-Z"
     ProcessSort.PID -> "PID"
 }
