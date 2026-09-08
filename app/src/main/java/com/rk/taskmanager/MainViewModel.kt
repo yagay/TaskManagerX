@@ -9,6 +9,7 @@ import com.rk.taskmanager.data.NetworkRepository
 import com.rk.taskmanager.data.ProcessRepository
 import com.rk.taskmanager.data.SettingsRepository
 import com.rk.taskmanager.data.SystemStatsRepository
+import com.rk.taskmanager.model.NetworkSnapshot
 import com.rk.taskmanager.model.ProcessEntry
 import com.rk.taskmanager.model.ProcessSort
 import com.rk.taskmanager.model.RootState
@@ -25,8 +26,6 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
 class MainViewModel(application: Application) : AndroidViewModel(application) {
-    // Each collector owns a persistent root shell. RootShell serializes commands internally,
-    // so sharing one shell made process/GPU/network/system collection block each other.
     private val processShell = RootShell()
     private val statsShell = RootShell()
     private val gpuShell = RootShell()
@@ -54,6 +53,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     val state: StateFlow<TaskManagerUiState> = _state.asStateFlow()
 
     private var monitorJob: Job? = null
+    private var networkJob: Job? = null
 
     init { start() }
 
@@ -75,6 +75,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
             _state.value = _state.value.copy(framework = frameworkRepository.detect())
             refreshInternal()
+            startNetworkMonitor()
 
             while (isActive) {
                 val snapshot = _state.value
@@ -88,6 +89,16 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    private fun startNetworkMonitor() {
+        if (networkJob?.isActive == true) return
+        networkJob = viewModelScope.launch {
+            while (isActive) {
+                refreshNetworkInternal()
+                delay(1_000L)
+            }
+        }
+    }
+
     fun refresh() {
         viewModelScope.launch {
             if (_state.value.root.granted) refreshInternal() else start()
@@ -96,7 +107,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun loadProcessDetails(process: ProcessEntry, onLoaded: (ProcessEntry) -> Unit) {
         viewModelScope.launch {
-            onLoaded(processRepository.loadDetails(process))
+            val detailed = processRepository.loadDetails(process)
+            val current = _state.value.processes.firstOrNull { it.pid == detailed.pid }
+            onLoaded(
+                if (current != null) detailed.copy(
+                    rxBytesPerSecond = current.rxBytesPerSecond,
+                    txBytesPerSecond = current.txBytesPerSecond,
+                ) else detailed
+            )
         }
     }
 
@@ -176,7 +194,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private suspend fun refreshInternal() = coroutineScope {
         runCatching {
-            // System, process and GPU collection are independent and can run concurrently.
             val systemDeferred = async { statsRepository.read() }
             val processDeferred = async {
                 val pinned = settings.pinnedProcesses
@@ -187,18 +204,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             val gpuDeferred = async { gpuRepository.read() }
 
             val system = systemDeferred.await()
-            val processes = processDeferred.await()
+            val rawProcesses = processDeferred.await()
             val gpu = gpuDeferred.await()
 
-            // Network needs the current UID set, but it owns a separate root shell so it
-            // no longer blocks the process scanner itself.
-            val network = networkRepository.read(processes.map { it.uid }.filter { it >= 0 }.toSet())
-
             val old = _state.value
+            val processes = applyNetworkSpeeds(rawProcesses, old.network)
             _state.value = old.copy(
                 system = system,
                 gpu = gpu,
-                network = network,
                 processes = processes,
                 processCount = processes.size,
                 threadCount = processes.sumOf { it.threads },
@@ -217,6 +230,62 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    private suspend fun refreshNetworkInternal() {
+        if (!_state.value.root.granted) return
+        runCatching {
+            val currentProcesses = _state.value.processes
+            val network = networkRepository.read(
+                currentProcesses.map { it.uid }.filter { it >= 0 }.toSet()
+            )
+            val old = _state.value
+            _state.value = old.copy(
+                network = network,
+                processes = applyNetworkSpeeds(old.processes, network),
+            )
+        }
+    }
+
+    /**
+     * Network counters are per UID, not per process. To avoid falsely multiplying one
+     * UID's traffic across every child process, show the aggregate only on one primary
+     * process row for that UID. The dedicated Network page still shows the exact UID row.
+     */
+    private fun applyNetworkSpeeds(
+        processes: List<ProcessEntry>,
+        network: NetworkSnapshot,
+    ): List<ProcessEntry> {
+        if (processes.isEmpty()) return processes
+        val speedByUid = network.entries.associateBy { it.uid }
+        if (speedByUid.isEmpty()) {
+            return processes.map {
+                if (it.rxBytesPerSecond == 0L && it.txBytesPerSecond == 0L) it
+                else it.copy(rxBytesPerSecond = 0L, txBytesPerSecond = 0L)
+            }
+        }
+
+        val primaryPidByUid = processes
+            .groupBy { it.uid }
+            .mapValues { (_, group) ->
+                group.firstOrNull { process ->
+                    process.packageName != null &&
+                        (process.command == process.packageName ||
+                            process.command.startsWith(process.packageName + ":"))
+                }?.pid ?: group.first().pid
+            }
+
+        return processes.map { process ->
+            val speed = speedByUid[process.uid]
+            if (speed != null && primaryPidByUid[process.uid] == process.pid) {
+                process.copy(
+                    rxBytesPerSecond = speed.rxBytesPerSecond,
+                    txBytesPerSecond = speed.txBytesPerSecond,
+                )
+            } else {
+                process.copy(rxBytesPerSecond = 0L, txBytesPerSecond = 0L)
+            }
+        }
+    }
+
     private fun appendHistory(values: List<Float>, value: Float): List<Float> =
         (values + value).takeLast(60)
 
@@ -228,6 +297,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     override fun onCleared() {
         monitorJob?.cancel()
+        networkJob?.cancel()
         processShell.close()
         statsShell.close()
         gpuShell.close()
