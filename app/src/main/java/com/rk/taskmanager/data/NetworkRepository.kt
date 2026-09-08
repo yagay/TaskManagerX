@@ -22,29 +22,27 @@ class NetworkRepository(
     private var packageCacheTime = 0L
     private var previous: Map<Int, Counter> = emptyMap()
     private var previousNanos: Long = 0L
+    private var previousBackend: String? = null
 
     suspend fun read(knownUids: Set<Int>): NetworkSnapshot = withContext(Dispatchers.IO) {
         refreshPackageCacheIfNeeded()
         val nowNanos = SystemClock.elapsedRealtimeNanos()
 
-        val netdCounters = readRootNetdEbpf()
-        val qtaguidCounters = if (netdCounters.isEmpty()) readRootQtaguid() else emptyMap()
-
+        val rootSample = readRootUidCounters()
         val backend: String
         val current: Map<Int, Counter>
-        when {
-            netdCounters.isNotEmpty() -> {
-                backend = "Root netd eBPF"
-                current = netdCounters
-            }
-            qtaguidCounters.isNotEmpty() -> {
+
+        if (rootSample.counters.isNotEmpty()) {
+            backend = rootSample.backend
+            current = rootSample.counters
+        } else {
+            val qtaguidCounters = readRootQtaguid()
+            if (qtaguidCounters.isNotEmpty()) {
                 backend = "Root qtaguid"
                 current = qtaguidCounters
-            }
-            else -> {
-                // Android N+ public TrafficStats can only read the calling UID.
-                // Keep this last-resort path for diagnostics rather than pretending
-                // it represents all applications.
+            } else {
+                // Android N+ public TrafficStats cannot provide arbitrary other UIDs.
+                // Keep this only as an explicit diagnostic fallback.
                 backend = "TrafficStats (own UID only)"
                 val uid = Process.myUid()
                 val rx = TrafficStats.getUidRxBytes(uid)
@@ -53,17 +51,32 @@ class NetworkRepository(
             }
         }
 
+        // Never compare counters from different backends. Their accounting domains can differ,
+        // which otherwise produces either huge spikes or a permanent stream of clamped zeroes.
+        if (previousBackend != null && previousBackend != backend) {
+            previous = emptyMap()
+            previousNanos = 0L
+        }
+
         val elapsedSeconds = if (previousNanos > 0L) {
             (nowNanos - previousNanos).coerceAtLeast(1L) / 1_000_000_000.0
         } else 0.0
 
+        val uidFilter = if (knownUids.isEmpty()) null else knownUids
         val entries = if (elapsedSeconds <= 0.0) {
             emptyList()
         } else {
             current.mapNotNull { (uid, value) ->
+                if (uidFilter != null && uid !in uidFilter && uid !in packageCache) return@mapNotNull null
+
                 val old = previous[uid] ?: return@mapNotNull null
-                val rx = max(0L, ((value.rx - old.rx) / elapsedSeconds).toLong())
-                val tx = max(0L, ((value.tx - old.tx) / elapsedSeconds).toLong())
+                val deltaRx = value.rx - old.rx
+                val deltaTx = value.tx - old.tx
+                // Counter reset/rollover: skip this sample instead of showing a false speed.
+                if (deltaRx < 0L || deltaTx < 0L) return@mapNotNull null
+
+                val rx = max(0L, (deltaRx / elapsedSeconds).toLong())
+                val tx = max(0L, (deltaTx / elapsedSeconds).toLong())
                 if (rx == 0L && tx == 0L) return@mapNotNull null
 
                 val identities = packageCache[uid].orEmpty()
@@ -77,11 +90,13 @@ class NetworkRepository(
                     rxBytesPerSecond = rx,
                     txBytesPerSecond = tx,
                 )
-            }.sortedByDescending { it.totalBytesPerSecond }
+            }.sortedByDescending { max(it.rxBytesPerSecond, it.txBytesPerSecond) }
         }
 
         previous = current
         previousNanos = nowNanos
+        previousBackend = backend
+
         NetworkSnapshot(
             entries = entries,
             totalRxBytesPerSecond = entries.sumOf { it.rxBytesPerSecond },
@@ -92,44 +107,70 @@ class NetworkRepository(
     }
 
     /**
-     * Modern Android (9+) accounts traffic in netd eBPF maps. AOSP exposes the
-     * aggregate per-UID map through `dumpsys netd trafficcontroller` as:
-     *
-     *   mAppUidStatsMap:
-     *   uid rxBytes rxPackets txBytes txPackets
-     *   10234 12345 100 67890 120
-     *
-     * Root lets us read this without the public API's cross-UID privacy limit.
+     * mAppUidStatsMap used to be dumped by netd's TrafficController. Newer Android
+     * moved the map dump to NetworkStatsService, so probe the modern location first
+     * and keep the old locations for OEM/backward compatibility.
      */
-    private suspend fun readRootNetdEbpf(): Map<Int, Counter> {
-        val raw = runCatching {
-            shell.execute("dumpsys netd trafficcontroller 2>/dev/null", 6_000).stdout
-        }.getOrDefault("")
-        if (!raw.contains("mAppUidStatsMap")) return emptyMap()
+    private suspend fun readRootUidCounters(): RootSample {
+        val probes = listOf(
+            "Root netstats eBPF" to "dumpsys netstats 2>/dev/null",
+            "Root connectivity eBPF" to "dumpsys connectivity trafficcontroller 2>/dev/null",
+            "Root netd eBPF" to "dumpsys netd trafficcontroller 2>/dev/null",
+        )
+
+        for ((name, command) in probes) {
+            val raw = runCatching { shell.execute(command, 7_000).stdout }.getOrDefault("")
+            val parsed = parseAppUidStats(raw)
+            if (parsed.isNotEmpty()) return RootSample(name, parsed)
+        }
+        return RootSample("No cross-UID root counters", emptyMap())
+    }
+
+    /**
+     * Expected map body (indentation and punctuation around the section vary by release/OEM):
+     * uid rxBytes rxPackets txBytes txPackets
+     * 10234 12345 100 67890 120
+     */
+    private fun parseAppUidStats(raw: String): Map<Int, Counter> {
+        if (raw.isBlank() || !raw.contains("mAppUidStatsMap")) return emptyMap()
 
         val result = HashMap<Int, Counter>()
-        var inAppUidStats = false
-        raw.lineSequence().forEach { original ->
-            val line = original.trim()
-            if (line.contains("mAppUidStatsMap")) {
-                inAppUidStats = true
-                return@forEach
-            }
-            if (!inAppUidStats) return@forEach
+        var inMap = false
+        var sawData = false
 
-            // The following map starts after AppUidStatsMap. Stop before parsing it.
-            if (line.contains("mStatsMap") || line.contains("mUidStatsMap") || line.contains("mTagStatsMap")) {
-                inAppUidStats = false
-                return@forEach
+        for (original in raw.lineSequence()) {
+            val line = original.trim()
+
+            if (line.contains("mAppUidStatsMap")) {
+                inMap = true
+                sawData = false
+                continue
             }
-            if (line.isBlank() || line.startsWith("uid ") || line.startsWith("BPF map")) return@forEach
+            if (!inMap) continue
+
+            if (line.isBlank()) {
+                if (sawData) break
+                continue
+            }
+
+            // A new named dump section after data means the app-uid map is finished.
+            if (sawData && line.endsWith(":") && line.firstOrNull()?.isLetter() == true) break
+            if (line.startsWith("uid ", ignoreCase = true) ||
+                line.startsWith("BPF map", ignoreCase = true) ||
+                line.contains("status:", ignoreCase = true)
+            ) continue
 
             val parts = line.split(Regex("\\s+"))
-            if (parts.size != 5) return@forEach
-            val uid = parts[0].toIntOrNull() ?: return@forEach
-            val rx = parts[1].toLongOrNull() ?: return@forEach
-            val tx = parts[3].toLongOrNull() ?: return@forEach
+            if (parts.size < 5) {
+                if (sawData && line.firstOrNull()?.isLetter() == true) break
+                continue
+            }
+
+            val uid = parts[0].trimEnd(':', ',').toIntOrNull() ?: continue
+            val rx = parts[1].trimEnd(',').toLongOrNull() ?: continue
+            val tx = parts[3].trimEnd(',').toLongOrNull() ?: continue
             result[uid] = Counter(rx, tx)
+            sawData = true
         }
         return result
     }
@@ -182,6 +223,7 @@ class NetworkRepository(
         packageCacheTime = now
     }
 
+    private data class RootSample(val backend: String, val counters: Map<Int, Counter>)
     private data class Counter(val rx: Long, val tx: Long)
 
     private data class PackageIdentity(
